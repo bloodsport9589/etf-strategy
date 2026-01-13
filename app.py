@@ -6,21 +6,17 @@ import plotly.graph_objects as go
 import numpy as np
 
 # ================= 页面配置 =================
-st.set_page_config(page_title="全球动量轮动 Pro Max", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="全球动量策略 (进攻版)", page_icon="🚀", layout="wide")
 
-st.title("🛡️ 全球动量轮动 Pro Max (低波增强版)")
-st.markdown("### 动能轮动 | 波动率加权 | RSI过热过滤 | 移动止损")
+st.title("🚀 全球动量策略 v3.0 (极速趋势版)")
+st.markdown("### 逻辑升级：纯粹动能 | 双均线风控 | 跌破MA20极速离场")
 
 # ================= 策略配置 =================
 # 核心参数
 HOLD_COUNT = 2          # 持仓数量
-MOMENTUM_FAST = 20      # 20日涨幅
-MOMENTUM_SLOW = 60      # 60日涨幅
-MA_FILTER = 60          # 趋势均线
-RSI_WINDOW = 14         # RSI 周期
-RSI_LIMIT = 82          # RSI 超买阈值 (超过这个不买/减仓)
-VOL_WINDOW = 20         # 波动率计算周期
-STOP_LOSS_PCT = 0.08    # 移动止损 (从最高点回撤 8% 离场)
+MOMENTUM_WINDOW = 20    # 动能窗口 (只看20日爆发力)
+MA_ENTRY = 60           # 进场趋势线 (牛熊分界)
+MA_EXIT = 20            # 离场生命线 (跌破即跑)
 BACKTEST_START = "20200101" 
 
 # 资产池
@@ -39,19 +35,7 @@ ASSETS = {
 
 BENCHMARKS = {"510300": "沪深300"}
 
-# ================= 辅助计算函数 =================
-
-def calculate_rsi(series, period=14):
-    """计算 RSI 指标"""
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-def calculate_volatility(df, window=20):
-    """计算滚动波动率 (标准差)"""
-    return df.pct_change().rolling(window=window).std()
+# ================= 计算核心 =================
 
 def calculate_max_drawdown(series):
     roll_max = series.cummax()
@@ -70,7 +54,6 @@ def get_historical_data():
     end_date = datetime.datetime.now().strftime("%Y%m%d")
     all_targets = {**ASSETS, **BENCHMARKS}
     
-    # 进度条
     progress_bar = st.progress(0)
     total = len(all_targets)
     
@@ -92,104 +75,71 @@ def get_historical_data():
     progress_bar.empty()
     return combined_df.sort_index().fillna(method='ffill')
 
-# ================= 核心回测引擎 (优化版) =================
-
 def run_backtest(df_close):
     trade_assets = list(ASSETS.values())
     valid_cols = [c for c in trade_assets if c in df_close.columns]
     df_trade = df_close[valid_cols]
     
-    # 1. 计算所有指标
+    # 1. 计算指标
     ret_daily = df_trade.pct_change()
     
-    # 动能
-    mom_20 = df_trade.pct_change(MOMENTUM_FAST)
-    mom_60 = df_trade.pct_change(MOMENTUM_SLOW)
-    score_df = mom_20 * 0.6 + mom_60 * 0.4
+    # 纯动能：只看 ROC 20
+    score_df = df_trade.pct_change(MOMENTUM_WINDOW)
     
-    # 均线
-    ma_60 = df_trade.rolling(window=MA_FILTER).mean()
+    # 双均线
+    ma_entry = df_trade.rolling(window=MA_ENTRY).mean() # MA60
+    ma_exit = df_trade.rolling(window=MA_EXIT).mean()   # MA20
     
-    # 波动率 (用于加权)
-    vol_df = calculate_volatility(df_trade, VOL_WINDOW)
-    
-    # RSI (用于过滤)
-    rsi_df = df_trade.apply(lambda x: calculate_rsi(x, RSI_WINDOW))
-    
-    # 2. 循环回测
+    # 2. 回测循环
     strategy_curve = [1.0]
-    dates = [df_trade.index[MA_FILTER]]
-    start_idx = MA_FILTER
+    dates = [df_trade.index[MA_ENTRY]]
+    start_idx = MA_ENTRY
     pos_history = [] 
-    
-    # 记录每个持有资产的最高价 (用于移动止损)
-    high_water_mark = {asset: 0 for asset in valid_cols}
-    current_holdings = []
 
     for i in range(start_idx, len(df_trade) - 1):
-        today = df_trade.index[i]
-        
-        # 获取当日数据
+        # 当日数据
         scores = score_df.iloc[i]
         prices = df_trade.iloc[i]
-        mas = ma_60.iloc[i]
-        rsis = rsi_df.iloc[i]
-        vols = vol_df.iloc[i]
+        ma_long = ma_entry.iloc[i]  # 60日线
+        ma_short = ma_exit.iloc[i]  # 20日线
         
-        # --- 筛选逻辑 ---
-        # 1. 均线过滤
-        cond_trend = prices > mas
-        # 2. 动能过滤
-        cond_mom = scores > 0
-        # 3. RSI 过滤 (不能太热)
-        cond_rsi = rsis < RSI_LIMIT
+        # --- 选股逻辑 ---
+        # 1. 动能必须 > 0
+        valid_assets = scores[scores > 0]
         
-        valid_assets = scores[cond_trend & cond_mom & cond_rsi]
-        
-        # 排序选出 Top N
+        # 2. 排序取 Top N
         targets = []
         if not valid_assets.empty:
             targets = valid_assets.sort_values(ascending=False).head(HOLD_COUNT).index.tolist()
         
-        # --- 移动止损检查 ---
-        # 如果某个资产本来在 targets 里，但触发了硬止损，把它剔除
-        final_targets = []
-        for asset in targets:
-            # 更新最高水位线
-            if asset not in current_holdings:
-                high_water_mark[asset] = prices[asset] # 新买入，重置最高价
-            else:
-                high_water_mark[asset] = max(high_water_mark[asset], prices[asset])
-            
-            # 检查回撤
-            drawdown = (prices[asset] - high_water_mark[asset]) / high_water_mark[asset]
-            
-            if drawdown > -STOP_LOSS_PCT: # 没有跌破 8%
-                final_targets.append(asset)
-            # else: 触发止损，不加入 final_targets (相当于卖出)
-
-        current_holdings = final_targets
+        # --- 风控逻辑 (Critical!) ---
+        # 即使选进了 Top 2，如果当前价格跌破 MA20，强制把这部分仓位变成现金
+        final_holdings = []
         
-        # --- 波动率加权分配 ---
-        # 如果选出2个，不是各50%，而是波动率越低给越多权重
+        for asset in targets:
+            # 规则：
+            # 如果是新开仓，必须站上 MA60 (牛市确认)
+            # 如果是持仓中，只要站上 MA20 (趋势未坏) 即可持有
+            # 这里简化为：只要在 Top 2 且 > MA20 就持有。
+            # 为什么用 MA20？因为 MA60 反应太慢，MA20 能在暴跌初期止损。
+            
+            if prices[asset] > ma_short[asset]:
+                final_holdings.append(asset)
+            # else: 价格 < MA20，虽然动能强（可能是刚开始跌），但也强制空仓
+            
+        # 计算次日收益 (等权重)
         daily_pnl = 0.0
         
-        if len(final_targets) > 0:
-            target_vols = vols[final_targets]
-            # 倒数加权: 1/vol
-            inv_vols = 1 / (target_vols + 0.0001) # 防止除以0
-            weights = inv_vols / inv_vols.sum()
+        # 假设总是把资金分成 HOLD_COUNT 份 (例如2份)
+        # 如果 final_holdings 只有 1 个，那就是 50% 仓位，剩下 50% 现金
+        if len(final_holdings) > 0:
+            weight_per_asset = 1.0 / HOLD_COUNT 
+            next_ret = ret_daily.iloc[i+1][final_holdings]
+            daily_pnl = (next_ret * weight_per_asset).sum()
             
-            # 计算次日收益
-            next_ret = ret_daily.iloc[i+1][final_targets]
-            daily_pnl = (next_ret * weights).sum()
-            
-            # 记录历史 (带权重显示)
-            pos_str = " | ".join([f"{t}({w:.0%})" for t, w in weights.items()])
-            pos_history.append(pos_str)
+            pos_history.append(" + ".join(final_holdings))
         else:
-            daily_pnl = 0.0
-            pos_history.append("现金/避险")
+            pos_history.append("现金")
             
         new_nav = strategy_curve[-1] * (1 + daily_pnl)
         strategy_curve.append(new_nav)
@@ -197,112 +147,98 @@ def run_backtest(df_close):
 
     return pd.Series(strategy_curve, index=dates), pos_history
 
-# ================= 主程序逻辑 =================
+# ================= 主程序 =================
 
 df_all = get_historical_data()
 
 if not df_all.empty:
     strategy_nav, pos_history = run_backtest(df_all)
     
-    # 处理基准
+    # 基准处理
     bench_nasdaq = df_all.get("纳指ETF")
-    bench_hs300 = df_all.get("沪深300")
-    
-    # 归一化
     start_date = strategy_nav.index[0]
-    if bench_nasdaq is not None: 
-        bench_nasdaq = bench_nasdaq.loc[start_date:] 
+    
+    if bench_nasdaq is not None:
+        bench_nasdaq = bench_nasdaq.loc[start_date:]
         bench_nasdaq = bench_nasdaq / bench_nasdaq.iloc[0]
-    if bench_hs300 is not None: 
-        bench_hs300 = bench_hs300.loc[start_date:]
-        bench_hs300 = bench_hs300 / bench_hs300.iloc[0]
 
-    # --- KPI 显示 ---
+    # --- KPI ---
     strat_cagr = calculate_cagr(strategy_nav)
     strat_dd = calculate_max_drawdown(strategy_nav)
     nasdaq_cagr = calculate_cagr(bench_nasdaq) if bench_nasdaq is not None else 0
     nasdaq_dd = calculate_max_drawdown(bench_nasdaq) if bench_nasdaq is not None else 0
     
-    st.subheader("📊 策略性能评估")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("策略年化回报", f"{strat_cagr*100:.1f}%", help="Compound Annual Growth Rate")
-    c2.metric("策略最大回撤", f"{strat_dd*100:.1f}%", delta=f"{-(nasdaq_dd - strat_dd)*100:.1f}% vs 纳指", delta_color="inverse", help="越小越好")
-    c3.metric("收益回撤比 (Calmar)", f"{abs(strat_cagr/strat_dd):.2f}", help="衡量性价比，越高越好。通常 > 1.0 算优秀")
-    c4.metric("当前净值", f"{strategy_nav.iloc[-1]:.3f}")
+    st.subheader("📊 策略性能评估 (vs 纳指)")
+    
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("策略年化 (CAGR)", f"{strat_cagr*100:.1f}%", delta=f"{(strat_cagr-nasdaq_cagr)*100:.1f}% vs 纳指")
+    k2.metric("最大回撤", f"{strat_dd*100:.1f}%", help="回撤越小越安全")
+    k3.metric("纳指最大回撤", f"{nasdaq_dd*100:.1f}%", delta_color="off")
+    k4.metric("当前净值", f"{strategy_nav.iloc[-1]:.3f}")
 
-    # --- 绘图 ---
+    # --- 图表 ---
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=strategy_nav.index, y=strategy_nav, mode='lines', name='优化策略 (低波)', line=dict(color='#00ff88', width=3)))
+    fig.add_trace(go.Scatter(x=strategy_nav.index, y=strategy_nav, mode='lines', name='进攻策略 v3', line=dict(color='#00ff88', width=2.5)))
     if bench_nasdaq is not None:
-        fig.add_trace(go.Scatter(x=bench_nasdaq.index, y=bench_nasdaq, mode='lines', name='纳指ETF (基准)', line=dict(color='#3366ff', width=1, dash='dot')))
-    if bench_hs300 is not None:
-        fig.add_trace(go.Scatter(x=bench_hs300.index, y=bench_hs300, mode='lines', name='沪深300', line=dict(color='#ff3333', width=1)))
-
-    fig.update_layout(title="策略 vs 基准 (引入波动率控制后)", template="plotly_dark", hovermode="x unified", xaxis_title="")
+        fig.add_trace(go.Scatter(x=bench_nasdaq.index, y=bench_nasdaq, mode='lines', name='纳斯达克100', line=dict(color='#3366ff', width=1.5, dash='dot')))
+    
+    fig.update_layout(template="plotly_dark", hovermode="x unified", title="净值曲线对比")
     st.plotly_chart(fig, use_container_width=True)
 
-    # --- 信号区 ---
+    # --- 今日信号 ---
     st.divider()
     latest_date = df_all.index[-1]
     
-    # 重新计算最新一天的因子以展示
     trade_df = df_all[list(ASSETS.values())]
-    
-    mom_fast = trade_df.pct_change(MOMENTUM_FAST).iloc[-1]
-    mom_slow = trade_df.pct_change(MOMENTUM_SLOW).iloc[-1]
-    scores = mom_fast * 0.6 + mom_slow * 0.4
-    
-    mas = trade_df.rolling(MA_FILTER).mean().iloc[-1]
-    rsis = trade_df.apply(lambda x: calculate_rsi(x, RSI_WINDOW)).iloc[-1]
-    vols = calculate_volatility(trade_df, VOL_WINDOW).iloc[-1]
+    scores = trade_df.pct_change(MOMENTUM_WINDOW).iloc[-1]
     prices = trade_df.iloc[-1]
+    ma_60 = trade_df.rolling(MA_ENTRY).mean().iloc[-1]
+    ma_20 = trade_df.rolling(MA_EXIT).mean().iloc[-1]
     
     rank_data = []
     for name in ASSETS.values():
         if name in scores:
             rank_data.append({
                 "名称": name,
-                "综合得分": scores[name],
-                "RSI(14)": rsis[name],
-                "波动率": vols[name],
-                "状态": "✅" if (prices[name]>mas[name] and scores[name]>0 and rsis[name]<RSI_LIMIT) else "❌"
+                "20日涨幅": scores[name],
+                "现价": prices[name],
+                "MA20(止损线)": ma_20[name],
+                "MA60(牛熊线)": ma_60[name],
+                "状态": "✅" if (prices[name] > ma_20[name] and scores[name] > 0) else "❌"
             })
             
-    rank_df = pd.DataFrame(rank_data).sort_values("综合得分", ascending=False).reset_index(drop=True)
+    rank_df = pd.DataFrame(rank_data).sort_values("20日涨幅", ascending=False).reset_index(drop=True)
     
     c1, c2 = st.columns([1, 1.5])
+    
     with c1:
-        st.subheader("💡 智能持仓建议")
+        st.subheader("💡 明日操作建议")
+        # 选取 Top 2
+        candidates = rank_df.head(HOLD_COUNT)
         
-        # 模拟选股
-        candidates = rank_df[rank_df['状态']=="✅"].head(HOLD_COUNT)
+        buy_list = []
+        for _, row in candidates.iterrows():
+            if row['状态'] == '✅':
+                buy_list.append(row['名称'])
         
-        if candidates.empty:
-            st.warning("🛑 **建议空仓**：市场风险过高 (RSI过热 或 趋势走坏)")
+        if not buy_list:
+            st.warning("🛑 **全仓防守**：市场所有头部资产均跌破 MA20。")
         else:
-            # 计算建议权重
-            cand_vols = candidates['波动率']
-            inv_vols = 1 / (cand_vols + 0.0001)
-            weights = inv_vols / inv_vols.sum()
+            st.success("✅ **持有/买入**")
+            for item in buy_list:
+                st.write(f"**{item}** (仓位 50%)")
             
-            st.success("✅ **建议买入组合**")
-            for name, w in weights.items():
-                st.write(f"**{name}**: 仓位 **{w*100:.1f}%**")
-            st.caption("注：仓位根据波动率动态分配，波动越小占比越大。")
+            if len(buy_list) < HOLD_COUNT:
+                st.info(f"注：剩余 {50 * (HOLD_COUNT - len(buy_list))}% 仓位保持现金。")
 
     with c2:
-        st.subheader("🔍 因子监控面板")
-        display_df = rank_df.copy()
-        display_df['综合得分'] = display_df['综合得分'].apply(lambda x: f"{x*100:.2f}%")
-        display_df['RSI(14)'] = display_df['RSI(14)'].apply(lambda x: f"{x:.1f}")
+        st.subheader("📋 实时排名 & 均线监控")
+        # 格式化
+        d_df = rank_df.copy()
+        d_df['20日涨幅'] = d_df['20日涨幅'].apply(lambda x: f"{x*100:.2f}%")
+        d_df['MA20(止损线)'] = d_df['MA20(止损线)'].apply(lambda x: f"{x:.3f}")
         
-        # 高亮 RSI 过热
-        def highlight_rsi(val):
-            v = float(val)
-            return 'color: red' if v > RSI_LIMIT else ''
+        def highlight_status(val):
+            return 'color: #00ff88' if val == '✅' else 'color: #ff4444'
             
-        st.dataframe(display_df.style.applymap(highlight_rsi, subset=['RSI(14)']), use_container_width=True)
-
-    with st.expander("查看调仓历史 (含权重)"):
-        h_df = pd.DataFrame({"日期": strategy_nav.index[-10:], "持仓详情": pos_history[-10:]}).sort_values("日期", ascending=False)
-        st.table(h_df)
+        st.dataframe(d_df.style.applymap(highlight_status, subset=['状态']), use_container_width=True)
