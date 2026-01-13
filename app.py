@@ -3,25 +3,27 @@ import akshare as ak
 import pandas as pd
 import datetime
 import plotly.graph_objects as go
+import plotly.express as px
 import numpy as np
 
 # ================= 页面配置 =================
-st.set_page_config(page_title="全球动量回测实验室", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="全球动能工厂 & 有效性检验", page_icon="🏭", layout="wide")
 
 # ================= 侧边栏：参数控制区 =================
-st.sidebar.header("🧪 策略参数实验室")
-st.sidebar.markdown("调整参数，实时寻找最佳策略")
+st.sidebar.header("🎛️ 因子合成实验室")
 
-# 1. 核心参数
-HOLD_COUNT = st.sidebar.slider("持仓数量 (Top N)", min_value=1, max_value=4, value=2, help="分散持仓可以降低波动，集中持仓进攻性更强")
-MOMENTUM_WINDOW = st.sidebar.slider("动能窗口 (N日涨幅)", min_value=5, max_value=60, value=20, help="越小越灵敏，但噪音越大；越大越稳，但反应越慢")
+# 1. 动能因子构造 (ROC Parameter)
+st.sidebar.subheader("1. 动能因子构造 (ROC)")
+ROC_SHORT = st.sidebar.slider("短期 ROC 周期 (天)", 5, 60, 20, help="捕捉短期爆发力")
+ROC_LONG = st.sidebar.slider("长期 ROC 周期 (天)", 30, 250, 60, help="捕捉中期趋势")
+ROC_WEIGHT = st.sidebar.slider("短期权重 (%)", 0, 100, 100, help="100%表示只看短期，0%表示只看长期，50%表示各占一半") / 100.0
 
-# 2. 风控参数
-st.sidebar.subheader("🛡️ 风控设置")
-MA_EXIT = st.sidebar.slider("止损均线 (MA)", min_value=5, max_value=120, value=20, help="价格跌破该均线强制空仓。MA20适合短线，MA60适合长线")
-MIN_HOLD_DAYS = st.sidebar.slider("最小持有天数 (防抖)", min_value=1, max_value=10, value=3, help="买入后至少持有N天，防止反复来回打脸")
+# 2. 交易参数
+st.sidebar.subheader("2. 交易执行")
+HOLD_COUNT = st.sidebar.number_input("持仓数量 (Top N)", min_value=1, max_value=5, value=1)
+MA_EXIT = st.sidebar.number_input("止损均线 (MA)", min_value=5, max_value=120, value=20, help="跌破该均线强制空仓")
 
-# 3. 回测范围
+# 3. 回测设置
 BACKTEST_START = st.sidebar.date_input("回测开始日期", datetime.date(2020, 1, 1))
 
 # 标的池
@@ -37,42 +39,22 @@ ASSETS = {
     "588050": "科创50",        
     "501018": "南方原油",      
 }
-
-BENCHMARKS_EXTRA = {"510300": "沪深300"}
+BENCHMARKS = {"510300": "沪深300"}
 
 # ================= 核心计算逻辑 =================
 
-def calculate_max_drawdown(series):
-    roll_max = series.cummax()
-    drawdown = (series - roll_max) / roll_max
-    return drawdown.min()
-
-def calculate_cagr(series):
-    if len(series) < 1: return 0
-    days = (series.index[-1] - series.index[0]).days
-    if days == 0: return 0
-    return (series.iloc[-1] / series.iloc[0]) ** (365 / days) - 1
-
-def calculate_sharpe(series):
-    """简单夏普比率 (假设无风险利率为0)"""
-    if len(series) < 2: return 0
-    ret = series.pct_change().dropna()
-    return ret.mean() / ret.std() * np.sqrt(252)
-
 @st.cache_data(ttl=43200) 
-def get_historical_data(start_date_str):
-    """获取数据 (带缓存)"""
+def get_historical_data(start_date):
+    """获取数据"""
     combined_df = pd.DataFrame()
     end_date = datetime.datetime.now().strftime("%Y%m%d")
-    start_str = start_date_str.strftime("%Y%m%d")
+    start_str = start_date.strftime("%Y%m%d")
     
-    # 进度条
-    progress_text = st.empty()
-    all_targets = {**ASSETS, **BENCHMARKS_EXTRA}
-    total = len(all_targets)
+    targets = {**ASSETS, **BENCHMARKS}
+    progress = st.empty()
     
-    for i, (code, name) in enumerate(all_targets.items()):
-        progress_text.text(f"正在加载数据: {name}...")
+    for i, (code, name) in enumerate(targets.items()):
+        progress.text(f"正在加载: {name}...")
         try:
             df = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=start_str, end_date=end_date, adjust="qfq")
             df = df.rename(columns={"日期": "date", "收盘": "close"})
@@ -86,189 +68,113 @@ def get_historical_data(start_date_str):
                 combined_df = combined_df.join(df, how='outer')
         except: pass
     
-    progress_text.empty()
+    progress.empty()
     return combined_df.sort_index().fillna(method='ffill')
 
-def run_dynamic_backtest(df_close, hold_n, mom_win, ma_win, min_hold):
-    """动态回测引擎"""
-    trade_assets = list(ASSETS.values())
-    valid_cols = [c for c in trade_assets if c in df_close.columns]
-    df_trade = df_close[valid_cols]
+def calculate_factors(df, roc_s, roc_l, w_s):
+    """计算复合因子"""
+    trade_cols = list(ASSETS.values())
+    df_trade = df[trade_cols]
     
-    # 1. 计算因子
-    ret_daily = df_trade.pct_change()
-    score_df = df_trade.pct_change(mom_win) # 动态动能窗口
-    ma_line = df_trade.rolling(window=ma_win).mean() # 动态均线
+    # 计算双频 ROC
+    roc_short = df_trade.pct_change(roc_s)
+    roc_long = df_trade.pct_change(roc_l)
     
-    # 2. 回测循环
-    # 预热期取最大窗口
-    start_idx = max(mom_win, ma_win)
-    if start_idx >= len(df_trade): return pd.Series(), []
+    # 合成得分
+    score = roc_short * w_s + roc_long * (1 - w_s)
     
-    strategy_curve = [1.0]
+    # 均线
+    ma_exit = df_trade.rolling(MA_EXIT).mean()
+    
+    return score, ma_exit, df_trade
+
+def run_backtest(df_trade, score_df, ma_df):
+    """回测引擎"""
+    start_idx = max(ROC_LONG, ROC_SHORT, MA_EXIT) + 1
+    if start_idx >= len(df_trade): return None, None, None
+    
+    curve = [1.0]
     dates = [df_trade.index[start_idx]]
-    pos_history = [] 
+    pos_history = []
     
-    # 锁定状态记录 (用于最小持有期)
-    # 格式: {asset_name: days_held}
-    holding_days = {} 
-    last_holdings = []
+    ret_daily = df_trade.pct_change()
+    
+    # 用于有效性分析的数据
+    factor_analysis_data = [] # 记录每天的: [排名, 次日收益]
 
     for i in range(start_idx, len(df_trade) - 1):
         scores = score_df.iloc[i]
         prices = df_trade.iloc[i]
-        ma_vals = ma_line.iloc[i]
+        mas = ma_df.iloc[i]
         
-        # --- 策略逻辑 ---
+        # --- 1. 交易逻辑 ---
+        # 选出动能 > 0 且 价格 > 均线 的
+        valid = scores[(scores > 0) & (prices > mas)]
         
-        # 1. 找出所有符合买入条件的 (动能>0 且 >均线)
-        candidates = scores[(scores > 0) & (prices > ma_vals)].sort_values(ascending=False)
-        potential_buys = candidates.index.tolist()
-        
-        current_targets = []
-        
-        # 2. 核心：结合最小持有期决定持仓
-        # 先看昨天持有的，如果还没拿够天数，强制继续持有 (不管排名是否下降)
-        locked_assets = []
-        for asset in last_holdings:
-            days = holding_days.get(asset, 0)
-            if days < min_hold:
-                # 检查是否触发硬止损 (比如暴跌)，如果严重破位也可以强制卖，这里暂只用均线
-                # 如果还在均线上，就强制拿住
-                if prices[asset] > ma_vals[asset]:
-                    locked_assets.append(asset)
-        
-        # 填满剩余仓位
-        slots_left = hold_n - len(locked_assets)
-        new_picks = []
-        
-        if slots_left > 0:
-            for asset in potential_buys:
-                if asset not in locked_assets:
-                    new_picks.append(asset)
-                    if len(new_picks) == slots_left:
-                        break
-        
-        current_targets = locked_assets + new_picks
-        
-        # 3. 更新持有天数
-        new_holding_days = {}
-        for asset in current_targets:
-            # 如果昨天就有，天数+1；如果是新买的，天数=1
-            new_holding_days[asset] = holding_days.get(asset, 0) + 1
-        
-        holding_days = new_holding_days
-        last_holdings = current_targets
-        
-        # 4. 计算收益 (等权重)
-        daily_pnl = 0.0
-        if len(current_targets) > 0:
-            w = 1.0 / hold_n # 哪怕只选出1个，也只占 1/N 仓位 (剩余现金)
-            # w = 1.0 / len(current_targets) # 或者：选出几个就满仓几个 (更激进) -> 这里用保守算法，没选满就留现金
+        targets = []
+        if not valid.empty:
+            targets = valid.sort_values(ascending=False).head(HOLD_COUNT).index.tolist()
             
-            rets = ret_daily.iloc[i+1][current_targets]
-            daily_pnl = rets.sum() * w
-            pos_history.append(",".join(current_targets))
+        # 计算次日收益
+        day_pnl = 0.0
+        if targets:
+            w = 1.0 / HOLD_COUNT # 简单等权
+            rets = ret_daily.iloc[i+1][targets]
+            day_pnl = rets.sum() * w
+            pos_history.append(",".join(targets))
         else:
             pos_history.append("现金")
             
-        new_nav = strategy_curve[-1] * (1 + daily_pnl)
-        strategy_curve.append(new_nav)
+        curve.append(curve[-1] * (1 + day_pnl))
         dates.append(df_trade.index[i+1])
+        
+        # --- 2. 收集数据用于因子有效性分析 ---
+        # 我们想知道：今天排第1名的，明天到底涨了没？排倒数第1的，明天是不是跌了？
+        # 获取所有资产当天的排名 (降序，分值越高名次越靠前)
+        # 注意：这里我们不考虑均线过滤，纯粹看因子本身的预测能力
+        daily_rank = scores.rank(ascending=False, method='first') 
+        next_day_ret = ret_daily.iloc[i+1]
+        
+        for asset in scores.index:
+            if not np.isnan(scores[asset]) and not np.isnan(next_day_ret[asset]):
+                factor_analysis_data.append({
+                    "Rank": int(daily_rank[asset]),
+                    "Return": next_day_ret[asset]
+                })
 
-    return pd.Series(strategy_curve, index=dates), pos_history
+    return pd.Series(curve, index=dates), pos_history, pd.DataFrame(factor_analysis_data)
 
 # ================= 主界面 =================
 
-st.title("🧪 策略实验室")
-st.caption("拖动左侧滑块，找到纳指的克星。")
+st.title("🏭 动能策略工厂")
+st.markdown("通过调节 **ROC 参数**，观察策略变化，并检验因子是否有效。")
 
-# 获取数据
 df_all = get_historical_data(BACKTEST_START)
 
 if not df_all.empty:
-    # 运行回测
-    nav, history = run_dynamic_backtest(df_all, HOLD_COUNT, MOMENTUM_WINDOW, MA_EXIT, MIN_HOLD_DAYS)
+    # 1. 计算
+    score_df, ma_df, df_trade = calculate_factors(df_all, ROC_SHORT, ROC_LONG, ROC_WEIGHT)
+    nav, history, factor_data = run_backtest(df_trade, score_df, ma_df)
     
-    if not nav.empty:
-        # 基准处理
-        b_nasdaq = df_all.get("纳指ETF")
-        b_hs300 = df_all.get("沪深300")
+    if nav is not None:
+        # 创建两个标签页
+        tab1, tab2 = st.tabs(["📈 策略回测", "🔬 因子有效性体检"])
         
-        start_dt = nav.index[0]
-        # 截取同时间段并归一化
-        def prep_bench(s):
-            if s is None: return None
-            s = s.loc[start_dt:]
-            return s / s.iloc[0]
-        
-        b_nasdaq = prep_bench(b_nasdaq)
-        b_hs300 = prep_bench(b_hs300)
-        
-        # 计算指标
-        s_cagr = calculate_cagr(nav)
-        s_dd = calculate_max_drawdown(nav)
-        s_sharpe = calculate_sharpe(nav)
-        
-        n_cagr = calculate_cagr(b_nasdaq) if b_nasdaq is not None else 0
-        n_dd = calculate_max_drawdown(b_nasdaq) if b_nasdaq is not None else 0
-        n_sharpe = calculate_sharpe(b_nasdaq) if b_nasdaq is not None else 0
-        
-        # --- KPI 展示 ---
-        st.subheader("📊 回测结果对比")
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("年化收益 (CAGR)", f"{s_cagr*100:.1f}%", delta=f"{(s_cagr-n_cagr)*100:.1f}% vs 纳指")
-        col2.metric("最大回撤", f"{s_dd*100:.1f}%", delta=f"{-(n_dd-s_dd)*100:.1f}% vs 纳指", delta_color="inverse")
-        col3.metric("夏普比率 (性价比)", f"{s_sharpe:.2f}", delta=f"{s_sharpe-n_sharpe:.2f}", help="越高越好，表示承受单位风险获得的超额回报")
-        col4.metric("持仓数量", f"{HOLD_COUNT} 只")
-        
-        # --- 图表 ---
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=nav.index, y=nav, mode='lines', name='当前策略', line=dict(color='#00ff88', width=2)))
-        if b_nasdaq is not None:
-            fig.add_trace(go.Scatter(x=b_nasdaq.index, y=b_nasdaq, mode='lines', name='纳指100', line=dict(color='#3366ff', width=1.5)))
-        if b_hs300 is not None:
-            fig.add_trace(go.Scatter(x=b_hs300.index, y=b_hs300, mode='lines', name='沪深300', line=dict(color='#ff3333', width=1.5, dash='dot')))
-        
-        fig.update_layout(template="plotly_dark", hovermode="x unified", title="净值曲线", margin=dict(l=0, r=0, t=30, b=0))
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # --- 信号展示 ---
-        st.divider()
-        st.subheader("💡 基于当前参数的最新建议")
-        
-        # 重算今日信号
-        trade_df = df_all[list(ASSETS.values())]
-        scores = trade_df.pct_change(MOMENTUM_WINDOW).iloc[-1]
-        prices = trade_df.iloc[-1]
-        mas = trade_df.rolling(MA_EXIT).mean().iloc[-1]
-        
-        df_rank = pd.DataFrame({
-            "名称": ASSETS.values(),
-            "动能": [scores.get(n, -99) for n in ASSETS.values()],
-            "现价": [prices.get(n, 0) for n in ASSETS.values()],
-            "均线": [mas.get(n, 0) for n in ASSETS.values()]
-        })
-        
-        # 筛选
-        df_rank['状态'] = np.where((df_rank['动能']>0) & (df_rank['现价']>df_rank['均线']), '✅', '❌')
-        df_rank = df_rank.sort_values("动能", ascending=False).reset_index(drop=True)
-        
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            candidates = df_rank[df_rank['状态']=='✅'].head(HOLD_COUNT)
-            if candidates.empty:
-                st.warning("🛑 建议空仓")
-            else:
-                st.success("✅ 建议持有")
-                for _, row in candidates.iterrows():
-                    st.write(f"**{row['名称']}** (动能: {row['动能']*100:.1f}%)")
-        
-        with c2:
-            st.dataframe(df_rank.style.applymap(lambda v: 'color: #00ff88' if v=='✅' else 'color: #ff4444', subset=['状态']), use_container_width=True)
-
-    else:
-        st.warning("数据不足，请调整回测开始时间。")
-
-else:
-    st.error("无法加载数据。")
+        # ========== Tab 1: 回测结果 ==========
+        with tab1:
+            # 计算指标
+            total_ret = (nav.iloc[-1] - 1) * 100
+            cagr = (nav.iloc[-1] ** (365 / (nav.index[-1] - nav.index[0]).days) - 1) * 100
+            drawdown = ((nav - nav.cummax()) / nav.cummax()).min() * 100
+            
+            # 纳指对比
+            nasdaq = df_all['纳指ETF'].loc[nav.index[0]:]
+            nasdaq = nasdaq / nasdaq.iloc[0]
+            nasdaq_ret = (nasdaq.iloc[-1] - 1) * 100
+            
+            st.write("### 核心业绩")
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("总收益率", f"{total_ret:.1f}%", delta=f"{total_ret - nasdaq_ret:.1f}% vs 纳指")
+            k2.metric("年化收益", f"{cagr:.1f}%")
+            k3.metric("最大回撤", f"{drawdown:.1f}%", help="越小越好")
+            k4.metric("参数
