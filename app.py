@@ -109,7 +109,13 @@ def run_full_backtest(df_all, rs, rl, rw, h, m):
 # ================= 6. UI 界面渲染 =================
 st.title("🏭 全球动能工厂 (旗舰优化版)")
 df = get_optimized_data(tuple(st.session_state.my_assets.keys()), start_d)
-
+# --- 新增调试代码 ---
+if not df.empty:
+    with st.expander("🔍 数据源健康检查"):
+        st.write(f"数据范围: {df.index[0]} 至 {df.index[-1]}")
+        st.write("各标的数据完整度：")
+        st.write(df.notnull().sum()) # 查看每个标配有多少行有效数据
+# ------------------
 if not df.empty:
     nav_df, factor_df, score_df, ma_df, df_trade = run_full_backtest(df, rs, rl, rw, h, m)
     nav = nav_df['nav']
