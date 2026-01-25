@@ -1,5 +1,5 @@
 streamlit
-akshare>=1.15.50
+yfinance
 pandas
 plotly
-requests
+numpy
