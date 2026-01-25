@@ -5,14 +5,30 @@ import datetime
 import plotly.graph_objects as go
 import numpy as np
 
-# ================= 1. 基础配置 =================
-st.set_page_config(page_title="全球动能工厂-2026视觉旗舰", page_icon="🏭", layout="wide")
+# ================= 1. 基础配置与安全初始化 =================
+st.set_page_config(page_title="全球动能工厂-2026旗舰版", page_icon="🏭", layout="wide")
 
-# 初始化参数
+# 策略参数池
 DEFAULTS = {"rs": 20, "rl": 60, "rw": 100, "h": 1, "m": 20}
+
+# 强力初始化：确保 session_state 永远不会丢失键值
 for key, val in DEFAULTS.items():
     if key not in st.session_state:
-        st.session_state[key] = int(st.query_params.get(key, val))
+        # 尝试从 URL 获取，失败则使用默认值
+        try:
+            url_val = st.query_params.get(key)
+            st.session_state[key] = int(url_val) if url_val is not None else val
+        except:
+            st.session_state[key] = val
+
+def update_url():
+    """安全地同步参数到 URL"""
+    new_params = {}
+    for k in DEFAULTS.keys():
+        # 只有当键确实存在时才读取，防止 KeyError
+        if k in st.session_state:
+            new_params[k] = str(st.session_state[k])
+    st.query_params.update(new_params)
 
 # 标的池
 DEFAULT_ASSETS = {
@@ -25,9 +41,6 @@ BENCHMARKS = {"510300.SS": "沪深300", "^GSPC": "标普500"}
 
 if 'my_assets' not in st.session_state:
     st.session_state.my_assets = DEFAULT_ASSETS.copy()
-
-def update_url():
-    st.query_params.update({k: st.session_state[k] for k in DEFAULTS.keys()})
 
 # ================= 2. 侧边栏 =================
 with st.sidebar:
@@ -49,27 +62,35 @@ with st.sidebar:
                 st.rerun()
 
     st.divider()
-    rs = st.slider("短期周期 (rs)", 5, 60, value=st.session_state.rs, key="rs", on_change=update_url)
-    rl = st.slider("长期周期 (rl)", 30, 250, value=st.session_state.rl, key="rl", on_change=update_url)
-    rw = st.slider("短期权重 %", 0, 100, value=st.session_state.rw, key="rw", on_change=update_url) / 100.0
-    h = st.number_input("持仓数量", 1, 10, value=st.session_state.h, key="h", on_change=update_url)
-    m = st.number_input("风控均线", 5, 120, value=st.session_state.m, key="m", on_change=update_url)
+    # 绑定 session_state 的 Slider
+    rs = st.slider("短期周期 (rs)", 5, 60, key="rs", on_change=update_url)
+    rl = st.slider("长期周期 (rl)", 30, 250, key="rl", on_change=update_url)
+    rw = st.slider("短期权重 %", 0, 100, key="rw", on_change=update_url) / 100.0
+    h = st.number_input("持仓数量 ($H$)", 1, 10, key="h", on_change=update_url)
+    m = st.number_input("风控均线 ($MA$)", 5, 120, key="m", on_change=update_url)
     
     st.divider()
     st.subheader("📅 回测时间范围")
-    # 增加快捷日期选择
-    col_q1, col_q2, col_q3 = st.columns(3)
     today = datetime.date.today()
-    if col_q1.button("1年"): st.session_state.d_range = (today - datetime.timedelta(days=365), today)
-    if col_q2.button("3年"): st.session_state.d_range = (today - datetime.timedelta(days=365*3), today)
-    if col_q3.button("5年"): st.session_state.d_range = (today - datetime.timedelta(days=365*5), today)
+    default_start = today - datetime.timedelta(days=365)
     
-    dr = st.date_input("手动选择区间", value=st.session_state.get('d_range', (today - datetime.timedelta(days=365), today)), key="date_input")
+    # 快捷按钮逻辑修复：直接操作 session_state 并触发 rerun
+    col_q1, col_q2, col_q3 = st.columns(3)
+    if col_q1.button("1年"): 
+        st.session_state.d_range = (today - datetime.timedelta(days=365), today)
+        st.rerun()
+    if col_q2.button("3年"): 
+        st.session_state.d_range = (today - datetime.timedelta(days=365*3), today)
+        st.rerun()
+    if col_q3.button("5年"): 
+        st.session_state.d_range = (today - datetime.timedelta(days=365*5), today)
+        st.rerun()
+    
+    dr = st.date_input("手动选择区间", value=st.session_state.get('d_range', (default_start, today)), key="d_range")
 
-# ================= 3. 高效引擎 =================
+# ================= 3. 高效回测引擎 =================
 @st.cache_data(ttl=3600)
 def fetch_data(assets_dict, start_date, end_date, warm_up):
-    # 预热期逻辑：额外抓取数据确保第一天就有 ROC 评分
     actual_start = start_date - datetime.timedelta(days=warm_up * 1.6 + 20)
     targets = {**assets_dict, **BENCHMARKS}
     try:
@@ -85,6 +106,7 @@ def backtest_engine(df_all, assets, rs, rl, rw, h, m, user_start):
     if not trade_names: return None, None, None, None, 0
     
     df_t = df_all[trade_names]
+    # 计算 ROC 和 MA
     scores = (df_t.pct_change(rs) * rw) + (df_t.pct_change(rl) * (1-rw))
     ma = df_t.rolling(m).mean()
     rets = df_t.pct_change()
@@ -94,6 +116,7 @@ def backtest_engine(df_all, assets, rs, rl, rw, h, m, user_start):
     s_v, p_v, m_v, r_v = scores.values, df_t.values, ma.values, rets.values
 
     for i in range(warm_up, len(df_t) - 1):
+        # 绝对动能逻辑：$Price > MA$ 且 $Score > 0$
         mask = (s_v[i] > 0) & (p_v[i] > m_v[i])
         day_pnl, curr_h = 0.0, []
         if np.any(mask):
@@ -107,13 +130,13 @@ def backtest_engine(df_all, assets, rs, rl, rw, h, m, user_start):
         if hist[i+1] != hist[i]: t_count += 1
             
     full_df = pd.DataFrame({"nav": nav, "h": hist}, index=df_t.index)
-    # 截取区间并归一化
     final = full_df[full_df.index >= pd.Timestamp(user_start)].copy()
     if not final.empty: final['nav'] = final['nav'] / final['nav'].iloc[0]
     return final, scores, ma, df_t, t_count
 
-# ================= 4. 界面渲染 =================
+# ================= 4. UI 渲染 =================
 st.title("🏭 全球动能工厂")
+st.info("✅ V8 稳定性补丁已部署：修复了参数同步导致的 KeyError 崩溃。")
 
 if isinstance(dr, tuple) and len(dr) == 2:
     s_date, e_date = dr
@@ -125,7 +148,7 @@ if isinstance(dr, tuple) and len(dr) == 2:
         if res_df is not None and not res_df.empty:
             nav = res_df['nav']
             
-            # --- KPI 指标 ---
+            # --- 指标面板 ---
             daily_r = nav.pct_change().dropna()
             mdd = ((nav - nav.cummax()) / nav.cummax()).min()
             sharpe = (daily_r.mean() * 252 - 0.02) / (daily_r.std() * np.sqrt(252)) if not daily_r.empty else 0
@@ -139,47 +162,47 @@ if isinstance(dr, tuple) and len(dr) == 2:
 
             # --- 图表美化 ---
             st.divider()
-            st.subheader(f"📊 策略路径分析 ({s_date} ➟ {e_date})")
             fig = go.Figure()
-
-            # 1. 区域背景 (基于趋势判定)
-            status = (nav >= nav.rolling(10).mean().fillna(method='bfill')).astype(int)
+            # 趋势背景
+            ma_nav = nav.rolling(min(10, len(nav))).mean().fillna(method='bfill')
+            status = (nav >= ma_nav).astype(int)
             c_idx = np.where(status.diff().fillna(0) != 0)[0]
             segs = np.concatenate(([0], c_idx, [len(nav)-1]))
             for i in range(len(segs)-1):
                 cl = "rgba(0, 255, 136, 0.05)" if status.iloc[segs[i+1]] == 1 else "rgba(255, 68, 68, 0.05)"
                 fig.add_vrect(x0=nav.index[segs[i]], x1=nav.index[segs[i+1]], fillcolor=cl, line_width=0, layer="below")
 
-            # 2. 策略曲线 & 调仓点
+            # 策略主线
             fig.add_trace(go.Scatter(x=nav.index, y=nav, name="动能策略", line=dict(color='#00ff88', width=3),
                                      text=[f"持仓: {', '.join(h) if h else '空仓'}" for h in res_df['h']], hoverinfo="x+y+text"))
             
+            # 调仓点
             re_dates = [res_df.index[i] for i in range(1, len(res_df)) if res_df['h'].iloc[i] != res_df['h'].iloc[i-1]]
-            fig.add_trace(go.Scatter(x=re_dates, y=nav.loc[re_dates], mode='markers', name="调仓", 
+            fig.add_trace(go.Scatter(x=re_dates, y=nav.loc[re_dates], mode='markers', name="调仓日", 
                                      marker=dict(symbol='diamond', size=8, color='white', line=dict(width=1, color='#00ff88'))))
 
-            # 3. 基准曲线 (归一化)
+            # 基准
             for b_name in BENCHMARKS.values():
                 if b_name in df.columns:
                     b_nav = df[b_name][df.index >= pd.Timestamp(s_date)]
                     if not b_nav.empty:
                         fig.add_trace(go.Scatter(x=b_nav.index, y=b_nav/b_nav.iloc[0], name=b_name, 
-                                                 line=dict(dash='dot', width=1.2), opacity=0.5))
+                                                 line=dict(dash='dot', width=1.2), opacity=0.4))
 
             fig.update_layout(template="plotly_dark", height=550, margin=dict(l=10, r=10, t=10, b=10), 
                               hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
             st.plotly_chart(fig, width="stretch")
 
-            # --- 实时信号明细 ---
+            # --- 实时信号 ---
             st.divider()
-            st.subheader("📋 实时评分与操作建议")
+            st.subheader("📋 实时信号明细")
             l_s, l_p, l_m = score_df.iloc[-1], df_trade.iloc[-1], ma_df.iloc[-1]
-            ranks = [{"名称": n, "动能分": l_s[n], "最新价": l_p[n], "止损位": l_m[n], "操作": "✅ 持有" if (l_s[n]>0 and l_p[n]>l_m[n]) else "❌ 空仓"} for n in l_s.index]
-            st.dataframe(pd.DataFrame(ranks).sort_values("动能分", ascending=False).style.format({"动能分": "{:.2%}", "最新价": "{:.2f}"})
-                         .map(lambda x: 'color: #00ff88' if "✅" in str(x) else 'color: #ff4444', subset=['操作']), width="stretch")
+            ranks = [{"名称": n, "评分": l_s[n], "价格": l_p[n], "止损位": l_m[n], "信号": "✅ 持有" if (l_s[n]>0 and l_p[n]>l_m[n]) else "❌ 空仓"} for n in l_s.index]
+            st.dataframe(pd.DataFrame(ranks).sort_values("评分", ascending=False).style.format({"评分": "{:.2%}", "价格": "{:.2f}"})
+                         .map(lambda x: 'color: #00ff88' if "✅" in str(x) else 'color: #ff4444', subset=['信号']), width="stretch")
         else:
-            st.error("无法生成回测，请检查日期范围是否包含足够的交易日。")
+            st.warning("⚠️ 无法在选定区间生成回测，请尝试拉长日期范围。")
     else:
-        st.warning("📡 数据抓取中，请确认代码正确且网络畅通。")
+        st.error("📡 数据引擎未响应，请检查品种代码是否规范。")
 else:
-    st.info("💡 请选择完整的开始与结束日期。")
+    st.info("💡 请在侧边栏完整选择回测的【开始日期】和【结束日期】。")
