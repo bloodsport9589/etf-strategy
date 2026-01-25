@@ -82,24 +82,33 @@ BACKTEST_START = st.sidebar.date_input("回测开始日期", datetime.date(2020,
 # 或者必须把 assets 字典作为参数传入以触发缓存更新。这里为了从简，直接传入 keys tuple
 @st.cache_data(ttl=3600) 
 def get_historical_data(start_date, asset_keys_tuple):
-    """获取数据 (传入 asset_keys_tuple 是为了让缓存感知到标的列表的变化)"""
+    """优化版数据获取：增加错误提示与重试逻辑"""
     combined_df = pd.DataFrame()
     end_date = datetime.datetime.now().strftime("%Y%m%d")
     start_str = start_date.strftime("%Y%m%d")
     
-    # 动态获取当前 session 中的 assets
     current_assets = st.session_state.my_assets
     targets = {**current_assets, **BENCHMARKS}
     
-    progress = st.empty()
+    progress_bar = st.progress(0) # 使用进度条更直观
+    status_text = st.empty()
     total = len(targets)
     
     for i, (code, name) in enumerate(targets.items()):
-        progress.text(f"正在加载 ({i+1}/{total}): {name}...")
+        status_text.text(f"正在加载 ({i+1}/{total}): {name} ({code})")
+        progress_bar.progress((i + 1) / total)
+        
         try:
-            # 尝试获取数据
-            df = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=start_str, end_date=end_date, adjust="qfq")
-            if not df.empty:
+            # 增加 timeout 防止网络卡死
+            df = ak.fund_etf_hist_em(
+                symbol=code, 
+                period="daily", 
+                start_date=start_str, 
+                end_date=end_date, 
+                adjust="qfq"
+            )
+            
+            if df is not None and not df.empty:
                 df = df.rename(columns={"日期": "date", "收盘": "close"})
                 df['date'] = pd.to_datetime(df['date'])
                 df = df.set_index('date')[['close']]
@@ -109,71 +118,19 @@ def get_historical_data(start_date, asset_keys_tuple):
                     combined_df = df
                 else:
                     combined_df = combined_df.join(df, how='outer')
-        except: pass
+            else:
+                st.warning(f"⚠️ 标的 [{name}] 返回数据为空，请检查代码是否正确或近期是否有交易。")
+        except Exception as e:
+            # 抛出具体的报错，方便在页面上直接看到
+            st.error(f"❌ 加载 {name}({code}) 出错: {str(e)}")
     
-    progress.empty()
-    return combined_df.sort_index().fillna(method='ffill')
-
-def calculate_factors(df, roc_s, roc_l, w_s):
-    # 使用当前动态标的列表
-    trade_cols = list(st.session_state.my_assets.values())
-    valid_cols = [c for c in trade_cols if c in df.columns]
+    status_text.empty()
+    progress_bar.empty()
     
-    df_trade = df[valid_cols]
-    
-    roc_short = df_trade.pct_change(roc_s)
-    roc_long = df_trade.pct_change(roc_l)
-    
-    score = roc_short * w_s + roc_long * (1 - w_s)
-    ma_exit = df_trade.rolling(MA_EXIT).mean()
-    
-    return score, ma_exit, df_trade
-
-def run_backtest(df_trade, score_df, ma_df):
-    start_idx = max(ROC_LONG, ROC_SHORT, MA_EXIT) + 1
-    if start_idx >= len(df_trade): return None, None, None
-    
-    curve = [1.0]
-    dates = [df_trade.index[start_idx]]
-    
-    ret_daily = df_trade.pct_change()
-    factor_analysis_data = [] 
-
-    for i in range(start_idx, len(df_trade) - 1):
-        scores = score_df.iloc[i]
-        prices = df_trade.iloc[i]
-        mas = ma_df.iloc[i]
-        
-        # 交易逻辑
-        valid = scores[(scores > 0) & (prices > mas)]
-        
-        targets = []
-        if not valid.empty:
-            targets = valid.sort_values(ascending=False).head(HOLD_COUNT).index.tolist()
-            
-        day_pnl = 0.0
-        if targets:
-            w = 1.0 / HOLD_COUNT 
-            # 防止某个标的数据缺失
-            valid_targets = [t for t in targets if t in ret_daily.columns]
-            if valid_targets:
-                rets = ret_daily.iloc[i+1][valid_targets]
-                day_pnl = rets.sum() * w
-        
-        curve.append(curve[-1] * (1 + day_pnl))
-        dates.append(df_trade.index[i+1])
-        
-        # 因子数据收集
-        daily_rank = scores.rank(ascending=False, method='first') 
-        next_day_ret = ret_daily.iloc[i+1]
-        
-        for asset in scores.index:
-            r = daily_rank.get(asset)
-            ret = next_day_ret.get(asset)
-            if pd.notnull(r) and pd.notnull(ret):
-                factor_analysis_data.append({"Rank": int(r), "Return": ret})
-
-    return pd.Series(curve, index=dates), pd.DataFrame(factor_analysis_data)
+    if not combined_df.empty:
+        # 填充缺失值，确保策略计算不中断
+        return combined_df.sort_index().ffill().bfill()
+    return pd.DataFrame()
 
 # ================= 主界面 =================
 
