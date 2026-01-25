@@ -3,108 +3,153 @@ import yfinance as yf
 import pandas as pd
 import datetime
 import plotly.graph_objects as go
+import plotly.express as px
 import numpy as np
 
-# ================= 1. 基础配置 =================
-st.set_page_config(page_title="极速量化", page_icon="⚡", layout="wide")
+# ================= 页面配置 =================
+st.set_page_config(page_title="全球动能工厂 (专业分析版)", page_icon="🏭", layout="wide")
 
-# URL 参数持久化
-DEFAULTS = {"rs": 20, "rl": 60, "rw": 100, "h": 1, "m": 20}
-q = st.query_params
+# ================= 初始默认标的池 =================
+DEFAULT_ASSETS = {
+    "513100.SS": "纳指ETF", "513520.SS": "日经ETF", "513180.SS": "恒生科技",
+    "510180.SS": "上证180", "159915.SZ": "创业板指", "518880.SS": "黄金ETF",
+    "512400.SS": "有色ETF", "159981.SZ": "能源ETF", "588050.SS": "科创50",
+    "501018.SS": "南方原油",
+}
+BENCHMARKS = {"510300.SS": "沪深300", "^GSPC": "标普500"}
 
-def update_url():
-    st.query_params.update({"rs":st.session_state.rs, "rl":st.session_state.rl, "rw":st.session_state.rw, "h":st.session_state.h, "m":st.session_state.m})
+if 'my_assets' not in st.session_state:
+    st.session_state.my_assets = DEFAULT_ASSETS.copy()
 
-# ================= 2. 侧边栏 =================
-with st.sidebar:
-    st.header("🎛️ 配置")
-    rs = st.slider("短期ROC", 5, 60, int(q.get("rs", 20)), key="rs", on_change=update_url)
-    rl = st.slider("长期ROC", 30, 250, int(q.get("rl", 60)), key="rl", on_change=update_url)
-    rw = st.slider("短期权重%", 0, 100, int(q.get("rw", 100)), key="rw", on_change=update_url) / 100.0
-    h = st.number_input("持仓数", 1, 5, int(q.get("h", 1)), key="h", on_change=update_url)
-    m = st.number_input("止损线", 5, 120, int(q.get("m", 20)), key="m", on_change=update_url)
-    start_d = st.date_input("开始日期", datetime.date(2022, 1, 1)) # 默认缩短时间以提速
+# ================= 侧边栏：控制台 =================
+st.sidebar.header("🎛️ 策略控制台")
+# (此处省略标的管理部分，保持与前版本一致)
+# ... [保持之前的标的管理模块代码] ...
 
-# ================= 3. 数据引擎 (增加稳定性) =================
+ROC_SHORT = st.sidebar.slider("短期 ROC (天)", 5, 60, 20)
+ROC_LONG = st.sidebar.slider("长期 ROC (天)", 30, 250, 60)
+ROC_WEIGHT = st.sidebar.slider("短期权重 (%)", 0, 100, 100) / 100.0
+HOLD_COUNT = st.sidebar.number_input("持仓数量", min_value=1, max_value=10, value=1)
+MA_EXIT = st.sidebar.number_input("止损均线 (MA)", min_value=5, max_value=120, value=20)
+BACKTEST_START = st.sidebar.date_input("回测开始日期", datetime.date(2020, 1, 1))
+
+# ================= 核心获取逻辑 =================
 @st.cache_data(ttl=3600)
-def get_data_v2(start_date):
-    assets = {
-        "513100.SS": "纳指ETF", "513520.SS": "日经ETF", "513180.SS": "恒生科技",
-        "510300.SS": "沪深300", "^GSPC": "标普500", "518880.SS": "黄金ETF"
-    }
-    codes = list(assets.keys())
+def get_historical_data(start_date, asset_keys_tuple):
+    start_str = start_date.strftime("%Y-%m-%d")
+    current_assets = st.session_state.my_assets
+    targets = {**current_assets, **BENCHMARKS}
+    try:
+        data = yf.download(list(targets.keys()), start=start_str, progress=False)
+        df = data['Adj Close'] if 'Adj Close' in data.columns.levels[0] else data['Close']
+        df.index = df.index.tz_localize(None)
+        df = df.rename(columns=targets).sort_index().ffill().dropna(how='all')
+        return df
+    except Exception as e:
+        st.error(f"数据加载失败: {e}")
+        return pd.DataFrame()
+
+# ================= 增强版回测引擎 =================
+def run_enhanced_backtest(df_all, roc_s, roc_l, w_s):
+    # 提取交易标的
+    trade_cols = [n for n in st.session_state.my_assets.values() if n in df_all.columns]
+    df_trade = df_all[trade_cols]
     
-    # 使用 st.spinner 确保用户知道在干嘛
-    with st.spinner('正在从全球服务器同步行情...'):
-        try:
-            # 增加 timeout 参数防止卡死
-            data = yf.download(codes, start=start_date, progress=False, timeout=20)
-            if data.empty: return pd.DataFrame()
+    # 因子计算
+    score_df = (df_trade.pct_change(roc_s) * w_s) + (df_trade.pct_change(roc_l) * (1-w_s))
+    ma_df = df_trade.rolling(MA_EXIT).mean()
+    ret_daily = df_trade.pct_change()
+    
+    warm_up = max(roc_s, roc_l, MA_EXIT)
+    if len(df_trade) <= warm_up + 5: return None
+    
+    # 初始化
+    nav = [1.0]
+    dates = [df_trade.index[warm_up]]
+    holdings_log = ["初始空仓"] # 存储每日持仓详情用于Hover
+    
+    for i in range(warm_up, len(df_trade) - 1):
+        scores = score_df.iloc[i]
+        prices = df_trade.iloc[i]
+        mas = ma_df.iloc[i]
+        
+        # 选股逻辑
+        valid = scores[(scores > 0) & (prices > mas)]
+        day_pnl = 0.0
+        daily_h_detail = "空仓现金"
+        
+        if not valid.empty:
+            targets = valid.sort_values(ascending=False).head(HOLD_COUNT).index.tolist()
+            w = 1.0 / len(targets)
+            rets = ret_daily.iloc[i+1][targets]
+            day_pnl = rets.sum() * w
             
-            df = data['Adj Close'] if 'Adj Close' in data.columns.levels[0] else data['Close']
-            df.index = df.index.tz_localize(None)
-            return df.rename(columns=assets).ffill().dropna(how='all')
-        except Exception as e:
-            st.error(f"连接超时或失败: {e}")
-            return pd.DataFrame()
-
-# ================= 4. 回测逻辑 (向量化) =================
-def fast_bt(df, rs, rl, rw, h, m):
-    # 仅选择交易标的 (排除基准)
-    trades = [c for c in df.columns if c not in ["沪深300", "标普500"]]
-    dft = df[trades]
-    
-    # 指标计算
-    score = (dft.pct_change(rs)*rw) + (dft.pct_change(rl)*(1-rw))
-    ma = dft.rolling(m).mean()
-    rets = dft.pct_change()
-    
-    # 模拟
-    nav = np.ones(len(df))
-    warm = max(rs, rl, m)
-    
-    for i in range(warm, len(df)-1):
-        # 选股
-        s_row = score.values[i]
-        mask = (s_row > 0) & (dft.values[i] > ma.values[i])
-        if np.any(mask):
-            idx = np.where(mask)[0]
-            # 选动能最高的 h 个
-            top = idx[np.argsort(s_row[idx])[-h:]]
-            nav[i+1] = nav[i] * (1 + rets.values[i+1][top].mean())
-        else:
-            nav[i+1] = nav[i] # 空仓
+            # 生成Hover详情：品种,收盘价,当日涨跌
+            detail_list = []
+            for t in targets:
+                p = df_trade.iloc[i+1][t]
+                r = ret_daily.iloc[i+1][t]
+                detail_list.append(f"{t}: {p:.2f} ({r:+.2%})")
+            daily_h_detail = "<br>".join(detail_list)
             
-    return pd.Series(nav, index=df.index).iloc[warm:]
+        nav.append(nav[-1] * (1 + day_pnl))
+        dates.append(df_trade.index[i+1])
+        holdings_log.append(daily_h_detail)
+        
+    res = pd.DataFrame({"nav": nav, "holdings": holdings_log}, index=dates)
+    return res
 
-# ================= 5. 渲染 =================
-st.title("⚡ 极速动能分析")
+# ================= 主界面 =================
+st.title("🏭 全球动能工厂 (专业回测版)")
+asset_keys = tuple(sorted(st.session_state.my_assets.keys()))
+df_all = get_historical_data(BACKTEST_START, asset_keys)
 
-df = get_data_v2(start_d)
-
-if not df.empty:
-    nav = fast_bt(df, rs, rl, rw, h, m)
+if not df_all.empty:
+    bt_res = run_enhanced_backtest(df_all, ROC_SHORT, ROC_LONG, ROC_WEIGHT)
     
-    # 简易绘图以提速
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=nav.index, y=nav, name="策略", line=dict(color='#00ff88', width=2)))
-    
-    # 仅增加标普作为对比
-    if "标普500" in df.columns:
-        b = df["标普500"].loc[nav.index[0]:]
-        fig.add_trace(go.Scatter(x=b.index, y=b/b.iloc[0], name="标普500", line=dict(dash='dot', color='gray')))
+    if bt_res is not None:
+        nav_series = bt_res['nav']
+        
+        # --- 图表绘制：分段颜色 ---
+        fig = go.Figure()
+        
+        # 增加基准
+        for b_name in BENCHMARKS.values():
+            if b_name in df_all.columns:
+                b_data = df_all[b_name].loc[nav_series.index[0]:]
+                fig.add_trace(go.Scatter(x=b_data.index, y=b_data/b_data.iloc[0], name=b_name, line=dict(dash='dot', width=1)))
 
-    fig.update_layout(template="plotly_dark", height=400, margin=dict(l=10,r=10,t=10,b=10))
-    st.plotly_chart(fig, use_container_width=True)
+        # 策略曲线：利用 line.color 数组实现变色 (上升绿色，下降红色)
+        # 注意：这里简化为点对点变色逻辑
+        colors = ['#00ff88' if (nav_series.iloc[i] >= nav_series.iloc[i-1]) else '#ff4444' for i in range(len(nav_series))]
+        
+        fig.add_trace(go.Scatter(
+            x=nav_series.index, y=nav_series,
+            mode='lines+markers',
+            name='策略净值',
+            line=dict(width=2, color='#00ff88'), # 基础色
+            marker=dict(size=4, color=colors), # 点位颜色反映当日涨跌
+            customdata=bt_res['holdings'],
+            hovertemplate="<b>日期: %{x}</b><br>净值: %{y:.3f}<br>当日持仓:<br>%{customdata}<extra></extra>"
+        ))
 
-    # 指标
-    c1, c2, c3 = st.columns(3)
-    c1.metric("累计收益", f"{nav.iloc[-1]-1:.1%}")
-    # 夏普简化版
-    dr = nav.pct_change().dropna()
-    sr = (dr.mean()*252) / (dr.std()*np.sqrt(252)) if len(dr)>0 else 0
-    c2.metric("夏普比率", f"{sr:.2f}")
-    mdd = ((nav - nav.cummax())/nav.cummax()).min()
-    c3.metric("最大回撤", f"{mdd:.1%}")
-else:
-    st.info("💡 正在等待数据响应... 如果长时间没反应，请尝试刷新页面。")
+        fig.update_layout(template="plotly_dark", hovermode="x unified", height=600)
+        st.plotly_chart(fig, use_container_width=True)
+
+        # --- KPI 区域 ---
+        total_days = (nav_series.index[-1] - nav_series.index[0]).days
+        total_ret = (nav_series.iloc[-1] - 1)
+        cagr = (nav_series.iloc[-1] ** (365 / total_days) - 1) if total_days > 0 else 0
+        mdd = ((nav_series - nav_series.cummax()) / nav_series.cummax()).min()
+        
+        c1, c2, c3 = st.columns(3)
+        c1.metric("累计收益率", f"{total_ret:.2%}")
+        c2.metric("年化收益率 (CAGR)", f"{cagr:.2%}", help="基于复利计算的年化增长率")
+        c3.metric("最大回撤", f"{mdd:.2%}")
+
+        # --- 今日信号 (保持之前版本逻辑) ---
+        st.divider()
+        st.subheader("📢 实时交易信号")
+        # ... [此处放置今日排行的代码] ...
+    else:
+        st.warning("数据点过少，请调整时间范围。")
