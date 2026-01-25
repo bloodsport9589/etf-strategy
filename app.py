@@ -62,7 +62,7 @@ def get_optimized_data(assets_keys, start_date):
     df.index = df.index.tz_localize(None)
     return df.rename(columns=targets).ffill().dropna(how='all')
 
-# ================= 5. 回测与因子统计 (修复版) =================
+# ================= 5. 回测与因子统计 =================
 @st.cache_data
 def run_full_backtest(df_all, rs, rl, rw, h, m):
     trade_names = [n for n in st.session_state.my_assets.values() if n in df_all.columns]
@@ -85,7 +85,7 @@ def run_full_backtest(df_all, rs, rl, rw, h, m):
     for i in range(warm_up, len(df_t) - 1):
         s_row = score_vals[i]
         
-        # --- 因子体检记录 (修复 ValueError) ---
+        # --- 因子体检记录 ---
         if not np.isnan(s_row).all():
             day_ranks = pd.Series(s_row).rank(ascending=False, method='first')
             for idx_asset in range(len(s_row)):
@@ -139,14 +139,16 @@ if not df.empty:
             
     with c_s2:
         st.subheader("📊 实时排行 (今日实时数据)")
+        # 修复点 1：applymap -> map
+        # 修复点 2：use_container_width=True -> width="stretch"
         st.dataframe(rank_df.style.format({"动能评分": "{:.2%}", "价格": "{:.3f}", "止损线": "{:.3f}"})
-                     .applymap(lambda x: 'color: #00ff88' if "✅" in str(x) else 'color: #ff4444', subset=['信号']),
-                     use_container_width=True)
+                     .map(lambda x: 'color: #00ff88' if "✅" in str(x) else 'color: #ff4444', subset=['信号']),
+                     width="stretch")
 
     # --- Part 2: 策略表现图表 ---
     st.divider()
     fig = go.Figure()
-    # 趋势背景变色优化
+    # 趋势背景变色
     diff = (nav.diff() >= 0).astype(int)
     cp = diff.diff().fillna(0) != 0
     cp_idx = np.concatenate(([0], np.where(cp)[0], [len(nav)-1]))
@@ -159,10 +161,11 @@ if not df.empty:
     for b in BENCHMARKS.values():
         if b in df.columns:
             b_nav = df[b].loc[nav.index[0]:]; b_nav /= b_nav.iloc[0]
-            fig.add_trace(go.Scatter(x=b_nav.index, y=b_nav, name=b, line=dict(dash='dot', color='gray')))
+            fig.add_trace(go.Scatter(x=b_nav.index, y=b_nav, name=b, line=dict(dash='dot', color='gray'))))
     
     fig.update_layout(template="plotly_dark", height=500, margin=dict(l=10, r=10, t=10, b=10), hovermode="x unified")
-    st.plotly_chart(fig, use_container_width=True)
+    # 修复点 3：use_container_width=True -> width="stretch"
+    st.plotly_chart(fig, width="stretch")
 
     # --- Part 3: KPI 绩效面板 ---
     d_count = (nav.index[-1] - nav.index[0]).days
@@ -185,6 +188,7 @@ if not df.empty:
         fig_bar = px.bar(x=analysis.index, y=analysis.values, title="历史平均：各排名位置的次日表现",
                          labels={'x':'动能排名', 'y':'平均涨跌 (%)'}, color=analysis.values, color_continuous_scale="RdYlGn")
         fig_bar.update_layout(template="plotly_dark", height=400)
-        st.plotly_chart(fig_bar, use_container_width=True)
+        # 修复点 4：use_container_width=True -> width="stretch"
+        st.plotly_chart(fig_bar, width="stretch")
 else:
     st.warning("📡 正在尝试连接全球数据服务器，请稍候。若长时间无响应请确认 GitHub 上的 requirements.txt 包含 yfinance。")
