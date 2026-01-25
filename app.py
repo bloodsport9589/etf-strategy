@@ -161,7 +161,7 @@ if not df.empty:
     for b in BENCHMARKS.values():
         if b in df.columns:
             b_nav = df[b].loc[nav.index[0]:]; b_nav /= b_nav.iloc[0]
-            fig.add_trace(go.Scatter(x=b_nav.index, y=b_nav, name=b, line=dict(dash='dot', color='gray'))))
+            fig.add_trace(go.Scatter(x=b_nav.index, y=b_nav, name=b, line=dict(dash='dot', color='gray')))
     
     fig.update_layout(template="plotly_dark", height=500, margin=dict(l=10, r=10, t=10, b=10), hovermode="x unified")
     # 修复点 3：use_container_width=True -> width="stretch"
