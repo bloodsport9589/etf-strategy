@@ -1,4 +1,5 @@
 streamlit
-akshare
+akshare>=1.15.50
 pandas
 plotly
+requests
