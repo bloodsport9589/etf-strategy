@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 import numpy as np
 
 # ================= 1. 基础配置 =================
-st.set_page_config(page_title="全球动能工厂-旗舰可视化版", page_icon="🏭", layout="wide")
+st.set_page_config(page_title="全球动能工厂-旗舰版", page_icon="🏭", layout="wide")
 
 # 初始化参数
 DEFAULTS = {"rs": 20, "rl": 60, "rw": 100, "h": 1, "m": 20}
@@ -55,11 +55,11 @@ with st.sidebar:
             st.rerun()
             
     st.divider()
-    rs = st.slider("短期ROC", 5, 60, value=st.session_state.rs, key="rs", on_change=update_url)
-    rl = st.slider("长期ROC", 30, 250, value=st.session_state.rl, key="rl", on_change=update_url)
-    rw = st.slider("短期权重(%)", 0, 100, value=st.session_state.rw, key="rw", on_change=update_url) / 100.0
+    rs = st.slider("短期ROC (天)", 5, 60, value=st.session_state.rs, key="rs", on_change=update_url)
+    rl = st.slider("长期ROC (天)", 30, 250, value=st.session_state.rl, key="rl", on_change=update_url)
+    rw = st.slider("短期权重 (%)", 0, 100, value=st.session_state.rw, key="rw", on_change=update_url) / 100.0
     h = st.number_input("持仓数量", 1, 10, value=st.session_state.h, key="h", on_change=update_url)
-    m = st.number_input("止损均线", 5, 120, value=st.session_state.m, key="m", on_change=update_url)
+    m = st.number_input("止损均线 (MA)", 5, 120, value=st.session_state.m, key="m", on_change=update_url)
     start_d = st.date_input("回测开始", datetime.date(2020, 1, 1))
 
 # ================= 4. 数据引擎 =================
@@ -111,9 +111,8 @@ def run_backtest(df_all, assets, rs, rl, rw, h, m):
     res = pd.DataFrame({"nav": nav, "holdings": holdings_history}, index=df_t.index).iloc[warm_up:]
     return res, scores, ma, df_t
 
-# ================= 6. UI 渲染与增强图表 =================
+# ================= 6. UI 渲染 =================
 st.title("🏭 全球动能工厂 (智能分析版)")
-st.info("✅ 已修复语法错误。图表现在包含趋势背景色和调仓菱形标记。")
 
 df = get_data(st.session_state.my_assets, start_d)
 
@@ -123,25 +122,67 @@ if not df.empty:
     if res_df is not None:
         nav = res_df['nav']
         
+        # --- 新增：今日实时排位与推荐 (恢复) ---
+        st.divider()
+        st.subheader("📊 今日实时信号与排位")
+        
+        latest_scores = score_df.iloc[-1]
+        latest_prices = df_trade.iloc[-1]
+        latest_mas = ma_df.iloc[-1]
+        
+        rank_list = []
+        for name in latest_scores.index:
+            s, p, mv = latest_scores[name], latest_prices[name], latest_mas[name]
+            # 信号逻辑：动能评分>0 且 价格>均线
+            is_valid = (s > 0 and p > mv)
+            status = "✅ 持有" if is_valid else "❌ 空仓"
+            rank_list.append({
+                "名称": name, 
+                "动能评分": s, 
+                "最新价格": p, 
+                "20日止损线": mv, 
+                "操作信号": status
+            })
+        
+        rank_df = pd.DataFrame(rank_list).sort_values("动能评分", ascending=False).reset_index(drop=True)
+        
+        c_top1, c_top2 = st.columns([1, 2])
+        with c_top1:
+            # 显示顶部的推荐
+            top_buys = rank_df[rank_df['操作信号'] == "✅ 持有"].head(h)
+            if top_buys.empty:
+                st.error("🚨 策略建议：当前无达标品种，建议空仓避险。")
+            else:
+                st.success(f"🚀 当前建议持有 ({len(top_buys)}个):")
+                for n in top_buys['名称']:
+                    st.markdown(f"- **{n}**")
+        
+        with c_top2:
+            # 使用 2026 兼容语法显示明细表
+            st.dataframe(
+                rank_df.style.format({"动能评分": "{:.2%}", "最新价格": "{:.3f}", "20日止损线": "{:.3f}"})
+                .map(lambda x: 'color: #00ff88' if "✅" in str(x) else 'color: #ff4444', subset=['操作信号']),
+                width="stretch"
+            )
+
+        # --- 策略图表 (保持 V4 的强大视觉效果) ---
         st.divider()
         st.subheader("📈 策略表现与调仓详情")
         
         fig = go.Figure()
 
         # 1. 趋势背景染色
-        # 绿色: 净值 > 10日均线 (上升趋势); 红色: 净值 < 10日均线 (回调趋势)
         ma_nav = nav.rolling(10).mean().fillna(method='bfill')
         status = (nav >= ma_nav).astype(int) 
         change_idx = np.where(status.diff().fillna(0) != 0)[0]
         segments = np.concatenate(([0], change_idx, [len(nav)-1]))
-
         for i in range(len(segments)-1):
             start, end = segments[i], segments[i+1]
             is_up = status.iloc[end] == 1
             color = "rgba(0, 255, 136, 0.08)" if is_up else "rgba(255, 68, 68, 0.08)"
             fig.add_vrect(x0=nav.index[start], x1=nav.index[end], fillcolor=color, line_width=0, layer="below")
 
-        # 2. 调仓标记逻辑
+        # 2. 调仓标记
         rebalance_dates, rebalance_text = [], []
         for i in range(1, len(res_df)):
             prev, curr = set(res_df['holdings'].iloc[i-1]), set(res_df['holdings'].iloc[i])
@@ -151,7 +192,7 @@ if not df.empty:
                 text = f"<b>调仓详情:</b><br>+ {'/'.join(added) if added else '无'}<br>- {'/'.join(removed) if removed else '无'}"
                 rebalance_text.append(text)
 
-        # 3. 绘制主线
+        # 3. 曲线绘制
         hover_labels = [f"日期: {d.date()}<br>净值: {v:.4f}<br>持仓: {', '.join(h) if h else '空仓'}" 
                         for d, v, h in zip(res_df.index, nav, res_df['holdings'])]
 
@@ -161,14 +202,12 @@ if not df.empty:
             text=hover_labels, hoverinfo="text"
         ))
 
-        # 4. 绘制调仓标记点
         fig.add_trace(go.Scatter(
             x=rebalance_dates, y=nav.loc[rebalance_dates],
             mode='markers', marker=dict(symbol='diamond', size=9, color='white', line=dict(width=1, color='#00ff88')),
             name="调仓标记", text=rebalance_text, hoverinfo="text"
         ))
 
-        # 5. 绘制基准
         for b in BENCHMARKS.values():
             if b in df.columns:
                 b_nav = df[b].loc[nav.index[0]:]
@@ -180,7 +219,6 @@ if not df.empty:
         st.plotly_chart(fig, width="stretch")
 
         # --- KPI 面板 ---
-        # 修复此处括号问题
         mdd = ((nav - nav.cummax()) / nav.cummax()).min()
         cagr = (nav.iloc[-1]**(365/max((nav.index[-1]-nav.index[0]).days, 1)) - 1)
         
@@ -190,14 +228,7 @@ if not df.empty:
         k3.metric("最大回撤", f"{mdd:.2%}")
         k4.metric("调仓次数", f"{len(rebalance_dates)} 次")
 
-        # --- 实时成分表 ---
-        st.divider()
-        latest_holdings = res_df['holdings'].iloc[-1]
-        if latest_holdings:
-            st.success(f"🚀 当前建议持仓阵容：{' | '.join(latest_holdings)}")
-        else:
-            st.warning("🛡️ 当前建议：全额避险（空仓状态）")
     else:
-        st.error("回测计算失败，请尝试增加日期范围。")
+        st.error("计算结果为空，请调整参数。")
 else:
-    st.error("📡 数据引擎未响应，请检查品种代码或网络。")
+    st.error("📡 数据接口未响应，请检查代码或网络环境。")
