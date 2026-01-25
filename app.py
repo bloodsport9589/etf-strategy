@@ -1,71 +1,107 @@
-# ==========================================
-# 💡 新增模块：微信自动推送 (Auto Push)
-# ==========================================
 import streamlit as st
-import requests
-import json
+import yfinance as yf
+import pandas as pd
+import datetime
+import plotly.graph_objects as go
+import numpy as np
 
-def send_wechat_msg(title, content):
-    """发送微信推送"""
-    token = '你的_PUSHPLUS_TOKEN'  # <--- 请在这里填入你的 Token
-    url = 'http://www.pushplus.plus/send'
-    data = {
-        "token": token,
-        "title": title,
-        "content": content,
-        "template": "html"
+# ================= 1. 基础配置 =================
+st.set_page_config(page_title="全球动能工厂-最终版", page_icon="🏭", layout="wide")
+
+# URL 参数持久化功能
+DEFAULTS = {"rs": 20, "rl": 60, "rw": 100, "h": 1, "m": 20}
+q = st.query_params
+
+def update_url():
+    st.query_params.update({
+        "rs": st.session_state.rs, "rl": st.session_state.rl, 
+        "rw": st.session_state.rw, "h": st.session_state.h, "m": st.session_state.m
+    })
+
+# ================= 2. 侧边栏与参数 =================
+with st.sidebar:
+    st.header("🎛️ 策略控制台")
+    
+    # 获取 URL 缓存的参数值
+    rs = st.slider("短期ROC", 5, 60, int(q.get("rs", 20)), key="rs", on_change=update_url)
+    rl = st.slider("长期ROC", 30, 250, int(q.get("rl", 60)), key="rl", on_change=update_url)
+    rw = st.slider("短期权重%", 0, 100, int(q.get("rw", 100)), key="rw", on_change=update_url) / 100.0
+    h = st.number_input("持仓数量", 1, 5, int(q.get("h", 1)), key="h", on_change=update_url)
+    m = st.number_input("止损线(MA)", 5, 120, int(q.get("m", 20)), key="m", on_change=update_url)
+    
+    st.divider() # 这行现在不会报错了
+    start_d = st.date_input("回测起点", datetime.date(2022, 1, 1))
+
+# ================= 3. 高效数据获取 =================
+@st.cache_data(ttl=3600)
+def get_safe_data(start_date):
+    assets = {
+        "513100.SS": "纳指ETF", "513520.SS": "日经ETF", "513180.SS": "恒生科技",
+        "518880.SS": "黄金ETF", "510300.SS": "沪深300", "^GSPC": "标普500"
     }
-    try:
-        requests.post(url, json=data)
-    except:
-        pass
+    with st.spinner('同步全球行情中...'):
+        try:
+            data = yf.download(list(assets.keys()), start=start_date, progress=False, timeout=15)
+            if data.empty: return pd.DataFrame()
+            df = data['Adj Close'] if 'Adj Close' in data.columns.levels[0] else data['Close']
+            df.index = df.index.tz_localize(None)
+            return df.rename(columns=assets).ffill().dropna(how='all')
+        except Exception as e:
+            st.error(f"数据加载异常: {e}")
+            return pd.DataFrame()
 
-# 侧边栏开关
-st.sidebar.divider()
-enable_push = st.sidebar.checkbox("开启每日微信推送", value=False)
-
-if enable_push:
-    # 检查是否到了推送时间 (比如每天 15:00 收盘后，或者 09:00 开盘前)
-    # Streamlit 是被动触发的，你需要保持网页开启，或者使用 GitHub Actions 定时运行
-    # 这里演示手动点击触发，或者你每次打开网页时自动触发
+# ================= 4. 回测计算 (极速版) =================
+def run_bt(df, rs, rl, rw, h, m):
+    # 剔除基准标的
+    targets = [c for c in df.columns if c not in ["沪深300", "标普500"]]
+    dft = df[targets]
     
-    # 获取今日建议数据
-    latest_scores = score_df.iloc[-1]
-    latest_prices = df_trade.iloc[-1]
-    latest_mas = ma_df.iloc[-1]
+    # 动能评分与均线
+    score = (dft.pct_change(rs)*rw) + (dft.pct_change(rl)*(1-rw))
+    ma = dft.rolling(m).mean()
+    rets = dft.pct_change()
     
-    # 生成消息内容
-    msg_title = f"【量化日报】{datetime.datetime.now().strftime('%Y-%m-%d')}"
-    msg_content = "<h3>今日操作建议：</h3><ul>"
+    nav = np.ones(len(df))
+    warm = max(rs, rl, m)
     
-    rank_data = []
-    for name in latest_scores.index:
-        s = latest_scores.get(name, -99)
-        p = latest_prices.get(name, 0)
-        m = latest_mas.get(name, 0)
-        is_buy = (s > 0) and (p > m)
-        
-        status_icon = "✅" if is_buy else "❌"
-        # 只推送前 N 名
-        rank_data.append((name, s, is_buy))
-        
-    # 排序
-    rank_data.sort(key=lambda x: x[1], reverse=True)
-    top_n = rank_data[:HOLD_COUNT]
-    
-    has_buy = False
-    for name, score, is_buy in top_n:
-        if is_buy:
-            msg_content += f"<li style='color:green'><b>买入/持有：{name}</b> (动能 {score*100:.1f}%)</li>"
-            has_buy = True
+    for i in range(warm, len(df)-1):
+        s_row = score.values[i]
+        mask = (s_row > 0) & (dft.values[i] > ma.values[i])
+        if np.any(mask):
+            idx = np.where(mask)[0]
+            top = idx[np.argsort(s_row[idx])[-h:]]
+            nav[i+1] = nav[i] * (1 + rets.values[i+1][top].mean())
         else:
-            msg_content += f"<li style='color:red'>空仓观察：{name} (虽排名高但走弱)</li>"
+            nav[i+1] = nav[i]
             
-    if not has_buy:
-        msg_content += "<li><b>🛑 建议全额空仓/现金</b></li>"
-        
-    msg_content += "</ul><br><a href='https://你的Streamlit网址.streamlit.app'>点击查看详情</a>"
+    return pd.Series(nav, index=df.index).iloc[warm:]
+
+# ================= 5. 渲染展示 =================
+st.title("🏭 全球动能工厂")
+
+df_all = get_safe_data(start_d)
+
+if not df_all.empty:
+    nav = run_bt(df_all, rs, rl, rw, h, m)
     
-    if st.button("📤 手动发送今日推送到微信"):
-        send_wechat_msg(msg_title, msg_content)
-        st.toast("✅ 推送已发送！请查看微信")
+    # 绘图
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=nav.index, y=nav, name="策略净值", line=dict(color='#00ff88', width=2.5)))
+    
+    if "标普500" in df_all.columns:
+        b = df_all["标普500"].loc[nav.index[0]:]
+        fig.add_trace(go.Scatter(x=b.index, y=b/b.iloc[0], name="标普500基准", line=dict(dash='dot', color='gray')))
+
+    fig.update_layout(template="plotly_dark", height=450, margin=dict(l=10,r=10,t=30,b=10))
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 绩效指标
+    c1, c2, c3 = st.columns(3)
+    c1.metric("累计收益", f"{nav.iloc[-1]-1:.1%}")
+    # 夏普比率
+    dr = nav.pct_change().dropna()
+    sr = (dr.mean()*252) / (dr.std()*np.sqrt(252)) if len(dr)>0 else 0
+    c2.metric("夏普比率", f"{sr:.2f}")
+    c3.metric("最大回撤", f"{((nav - nav.cummax())/nav.cummax()).min():.1%}")
+else:
+    st.info("数据获取中，请稍候... 若长时间无响应请刷新。")
