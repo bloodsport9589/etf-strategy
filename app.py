@@ -7,10 +7,10 @@ import numpy as np
 from datetime import timedelta
 
 # ================= 1. 基础配置 =================
-st.set_page_config(page_title="全球动能工厂-2026旗舰版", page_icon="🏭", layout="wide")
+st.set_page_config(page_title="全球动能工厂-拐点侦测版", page_icon="🏭", layout="wide")
 
 # 初始化参数
-DEFAULTS = {"rs": 20, "rl": 60, "rw": 100, "h": 1, "m": 20}
+DEFAULTS = {"rs": 20, "rl": 60, "rw": 100, "h": 1, "m": 20, "rsi_period": 14}
 for key, val in DEFAULTS.items():
     if key not in st.session_state:
         try:
@@ -19,8 +19,6 @@ for key, val in DEFAULTS.items():
         except:
             st.session_state[key] = val
 
-# --- 恢复原始标的池 (包含可能无效的标的) ---
-# 系统会自动检测，如果某个标的在选定时间内没有数据，会自动忽略它，不会报错
 DEFAULT_ASSETS = {
     "513100.SS": "纳指ETF", 
     "513520.SS": "日经ETF", 
@@ -31,7 +29,8 @@ DEFAULT_ASSETS = {
     "512400.SS": "有色ETF", 
     "159981.SZ": "能源ETF", 
     "588050.SS": "科创50",
-    "501018.SS": "南方原油", # 保留了你要求的这个标的
+    "501018.SS": "南方原油",
+    "159985.SZ": "豆粕ETF",
 }
 BENCHMARKS = {"510300.SS": "沪深300", "^GSPC": "标普500"}
 
@@ -42,145 +41,101 @@ def update_url():
     params = {k: st.session_state[k] for k in DEFAULTS.keys() if k in st.session_state}
     st.query_params.update(params)
 
-# ================= 2. 侧边栏 =================
-with st.sidebar:
-    st.header("🎛️ 策略控制")
-    
-    with st.expander("📅 回测区间设置", expanded=True):
-        col_d1, col_d2 = st.columns(2)
-        default_start = datetime.date.today() - datetime.timedelta(days=365*3)
-        default_end = datetime.date.today()
-        
-        start_d = col_d1.date_input("开始日期", default_start)
-        end_d = col_d2.date_input("结束日期", default_end)
-        
-        if start_d >= end_d:
-            st.error("⚠️ 结束日期必须晚于开始日期")
+# ================= 2. 辅助函数：计算 RSI =================
+def calculate_rsi_series(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).fillna(0)
+    loss = (-delta.where(delta < 0, 0)).fillna(0)
+    avg_gain = gain.rolling(window=period, min_periods=1).mean()
+    avg_loss = loss.rolling(window=period, min_periods=1).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan) # 避免除以0
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50) # 填充初始值
 
-    with st.expander("📝 品种管理", expanded=False):
-        st.markdown("**添加/删除标的**")
-        c1, c2 = st.columns([2, 1])
-        nc = c1.text_input("代码", key="input_code")
-        nn = c2.text_input("名称", key="input_name")
-        if st.button("➕ 添加", width="stretch"):
-            if nc and nn:
-                st.session_state.my_assets[nc] = nn
-                st.rerun()
-        
-        st.divider()
-        for code, name in list(st.session_state.my_assets.items()):
-            cols = st.columns([3, 1])
-            cols[0].write(f"{name} ({code})")
-            if cols[1].button("❌", key=f"del_{code}"):
-                del st.session_state.my_assets[code]
-                st.rerun()
-    
-    st.divider()
-    rs = st.slider("短期评分周期 (天)", 5, 60, key="rs", on_change=update_url)
-    rl = st.slider("长期评分周期 (天)", 30, 250, key="rl", on_change=update_url)
-    rw = st.slider("权重分配 (短期%)", 0, 100, key="rw", on_change=update_url) / 100.0
-    h = st.number_input("持仓数量", 1, 10, key="h", on_change=update_url)
-    m = st.number_input("风控均线 (MA)", 5, 120, key="m", on_change=update_url)
-
-# ================= 3. 智能数据引擎 (自动剔除无效数据) =================
+# ================= 3. 数据引擎 =================
 @st.cache_data(ttl=3600)
 def get_clean_data(assets_dict, start_date, end_date):
     targets = {**assets_dict, **BENCHMARKS}
-    
-    # 向前多取一年，保证指标计算
     fetch_start = start_date - timedelta(days=365)
     fetch_end = end_date + timedelta(days=1)
     
     try:
-        # group_by='ticker' 模式下载，即使部分失败也不影响整体
         data = yf.download(list(targets.keys()), start=fetch_start, end=fetch_end, progress=False, group_by='ticker')
-        
-        if data.empty:
-            return pd.DataFrame()
+        if data.empty: return pd.DataFrame()
 
         clean_data = pd.DataFrame()
         
-        # --- 核心修改：逐个遍历标的，只保留有数据的 ---
         for ticker in targets.keys():
             try:
-                # 获取该标的的数据列
                 if isinstance(data.columns, pd.MultiIndex) and ticker in data.columns.levels[0]:
                     col_data = data[ticker]
-                elif ticker in data.columns: # 单层索引情况
-                    col_data = data[[ticker]] # 保持 DataFrame 结构
+                elif ticker in data.columns:
+                    col_data = data[[ticker]]
                 else:
-                    continue # 没下载到，跳过
+                    continue
 
-                # 提取收盘价
                 if 'Adj Close' in col_data.columns:
                     s = col_data['Adj Close']
                 elif 'Close' in col_data.columns:
                     s = col_data['Close']
-                elif isinstance(col_data, pd.DataFrame) and not col_data.empty:
-                    s = col_data.iloc[:, 0] # 盲取第一列
                 else:
-                    continue
+                    s = col_data.iloc[:, 0]
                 
-                # 再次检查：如果这一列全是 NaN，说明这个时间段没上市或已退市
-                if s.dropna().empty:
-                    continue 
-
+                if s.dropna().empty: continue 
                 clean_data[ticker] = s
 
             except Exception:
-                continue # 单个出错不影响大局
+                continue 
 
-        if clean_data.empty:
-            return pd.DataFrame()
-            
-        # 重命名
+        if clean_data.empty: return pd.DataFrame()
+        
         rename_map = {k: v for k, v in targets.items() if k in clean_data.columns}
         clean_data = clean_data.rename(columns=rename_map)
-        
-        # 统一索引格式
         clean_data.index = clean_data.index.tz_localize(None)
-        
-        # 注意：这里不能用 dropna(how='any')，否则只要有一个标的缺数据，整行就没了
-        # 我们只 fillna，保留 NaN，因为后面的策略引擎会自动处理 NaN
         clean_data = clean_data.ffill().dropna(how='all')
         
         return clean_data
-
     except Exception:
         return pd.DataFrame()
 
+# ================= 4. 增强版回测引擎 =================
 @st.cache_data
-def run_enhanced_backtest(df_all, assets, rs, rl, rw, h, m, user_start_date):
-    # 筛选出在 df_all 中存在的策略标的
+def run_enhanced_backtest(df_all, assets, rs, rl, rw, h, m, user_start_date, rsi_p):
     trade_names = [n for n in assets.values() if n in df_all.columns]
-    
-    # 如果没有有效标的，直接返回
-    if not trade_names: return None, None, None, None, 0
+    if not trade_names: return None, None, None, None, 0, None, None
     
     df_t = df_all[trade_names]
     
-    # 指标计算 (这里会产生大量的 NaN，对于未上市的品种)
-    scores = (df_t.pct_change(rs) * rw) + (df_t.pct_change(rl) * (1-rw))
+    # --- 1. 动量计算 ---
+    mom_short = df_t.pct_change(rs)
+    mom_long = df_t.pct_change(rl)
+    scores = (mom_short * rw) + (mom_long * (1-rw))
+    
+    # --- 2. 拐点侦测指标 ---
+    # (A) 加速度：短期动能 - 长期动能 (如果为负，说明涨势变慢，即使动能分为正)
+    # 为了量纲统一，我们简单用 mom_short - mom_long
+    acceleration = mom_short - mom_long
+    
+    # (B) RSI 指标
+    rsi_df = df_t.apply(lambda x: calculate_rsi_series(x, rsi_p))
+
     ma = df_t.rolling(m).mean()
     rets = df_t.pct_change()
     
-    warm_up = max(rs, rl, m)
+    warm_up = max(rs, rl, m, rsi_p)
     nav = np.ones(len(df_t))
     hist = [[] for _ in range(len(df_t))]
     trade_count = 0
 
-    s_vals, p_vals, m_vals, r_vals = scores.values, df_t.values, ma.values, rets.values
-
-    # --- 核心修改：动态交易循环 ---
+    s_vals = scores.values
+    p_vals = df_t.values
+    m_vals = ma.values
+    r_vals = rets.values
+    
+    # 回测循环
     for i in range(warm_up, len(df_t) - 1):
-        # 1. 基础信号：分 > 0 且 价格 > 均线
-        # 2. 关键过滤：np.isfinite() 确保只有“当天存在有效数据”的标的才参与
-        #    如果某标的当天是 NaN (未上市或停牌)，isfinite 为 False，自动被剔除
         valid_data_mask = np.isfinite(s_vals[i]) & np.isfinite(p_vals[i]) & np.isfinite(m_vals[i])
-        
         signal_mask = (s_vals[i] > 0) & (p_vals[i] > m_vals[i])
-        
-        # 最终候选池：既要有信号，又要数据有效
         final_mask = valid_data_mask & signal_mask
         
         day_pnl = 0.0
@@ -188,151 +143,166 @@ def run_enhanced_backtest(df_all, assets, rs, rl, rw, h, m, user_start_date):
         
         if np.any(final_mask):
             idx = np.where(final_mask)[0]
-            # 在有效且有信号的标的中，选分数最高的 Top H
-            # argsort 默认是从小到大，取最后 h 个
+            # 选分最高的 Top H
             top_idx = idx[np.argsort(s_vals[i][idx])[-h:]]
             
-            # 计算次日收益 (r_vals[i+1])
-            # 注意：如果次日收益是 NaN (比如突然停牌)，np.nanmean 会自动忽略它
             day_pnl = np.nanmean(r_vals[i+1][top_idx])
-            
-            # 防止 nanmean 在全 NaN 时返回 NaN，导致 nav 变成 nan
-            if np.isnan(day_pnl): 
-                day_pnl = 0.0
-                
+            if np.isnan(day_pnl): day_pnl = 0.0
             curr_h = sorted([trade_names[j] for j in top_idx])
         
         nav[i+1] = nav[i] * (1 + day_pnl)
         hist[i+1] = curr_h
         if hist[i+1] != hist[i]: trade_count += 1
             
-    # --- 结果截取 ---
+    # 数据截取
     full_res = pd.DataFrame({"nav": nav, "holdings": hist}, index=df_t.index)
-    
     mask_slice = full_res.index >= pd.to_datetime(user_start_date)
     res_sliced = full_res.loc[mask_slice].copy()
     
-    if res_sliced.empty:
-        return None, None, None, None, 0
+    if res_sliced.empty: return None, None, None, None, 0, None, None
         
     res_sliced['nav'] = res_sliced['nav'] / res_sliced['nav'].iloc[0]
     
     scores_sliced = scores.loc[mask_slice]
     ma_sliced = ma.loc[mask_slice]
     df_t_sliced = df_t.loc[mask_slice]
+    # 返回额外的指标供分析
+    acc_sliced = acceleration.loc[mask_slice]
+    rsi_sliced = rsi_df.loc[mask_slice]
     
-    return res_sliced, scores_sliced, ma_sliced, df_t_sliced, trade_count
+    return res_sliced, scores_sliced, ma_sliced, df_t_sliced, trade_count, acc_sliced, rsi_sliced
 
-# ================= 4. UI 渲染 =================
-st.title("🏭 全球动能工厂")
+# ================= 5. UI 渲染 =================
+with st.sidebar:
+    st.header("🎛️ 策略控制")
+    with st.expander("📅 回测区间", expanded=True):
+        col_d1, col_d2 = st.columns(2)
+        start_d = col_d1.date_input("开始", datetime.date.today() - datetime.timedelta(days=365*2))
+        end_d = col_d2.date_input("结束", datetime.date.today())
 
-st.toast(f"正在分析时间区间: {start_d} ~ {end_d}", icon="📡")
+    with st.expander("⚙️ 核心参数", expanded=True):
+        rs = st.slider("短期周期 (Fast)", 5, 60, key="rs", on_change=update_url)
+        rl = st.slider("长期周期 (Slow)", 30, 250, key="rl", on_change=update_url)
+        rw = st.slider("短期权重", 0, 100, key="rw", on_change=update_url) / 100.0
+        h = st.number_input("持仓数", 1, 10, key="h", on_change=update_url)
+        m = st.number_input("均线 (MA)", 5, 120, key="m", on_change=update_url)
+        rsi_p = st.number_input("RSI 周期", 5, 30, 14, key="rsi_period", on_change=update_url)
 
-# 获取数据 (含自动清洗)
+st.title("🏭 全球动能工厂 - 拐点侦测版")
+st.caption("引入加速度分析与 RSI 过热检测，辅助判断趋势末端")
+
 df = get_clean_data(st.session_state.my_assets, start_d, end_d)
 
 if not df.empty:
-    bt = run_enhanced_backtest(df, st.session_state.my_assets, rs, rl, rw, h, m, start_d)
-    res_df, score_df, ma_df, df_trade, t_count = bt if bt[0] is not None else (None, None, None, None, 0)
+    # 这里的解包增加了 acc (加速度) 和 rsi (相对强弱)
+    bt_res = run_enhanced_backtest(df, st.session_state.my_assets, rs, rl, rw, h, m, start_d, rsi_p)
+    res_df, score_df, ma_df, df_trade, t_count, acc_df, rsi_df = bt_res if bt_res[0] is not None else (None,)*7
     
     if res_df is not None:
         nav = res_df['nav']
-        
-        # 指标卡
-        mdd = ((nav - nav.cummax()) / nav.cummax()).min()
-        daily_rets = nav.pct_change().dropna()
-        days_period = (nav.index[-1] - nav.index[0]).days
-        ann_factor = 365 / max(days_period, 1)
-        sharpe = (daily_rets.mean() * 252 - 0.02) / (daily_rets.std() * np.sqrt(252)) if not daily_rets.empty else 0
-        
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("区间累计收益", f"{nav.iloc[-1]-1:.2%}")
-        k2.metric("年化收益", f"{(nav.iloc[-1]**ann_factor - 1):.2%}")
-        k3.metric("区间最大回撤", f"{mdd:.2%}", delta_color="inverse")
-        k4.metric("夏普比率", f"{sharpe:.2f}")
-        k5.metric("调仓/交易日", f"{t_count} 次 / {len(nav)} 天")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("累计收益", f"{nav.iloc[-1]-1:.2%}")
+        k2.metric("最大回撤", f"{((nav - nav.cummax()) / nav.cummax()).min():.2%}")
+        k3.metric("交易次数", t_count)
+        k4.metric("当前策略状态", "运行中" if nav.iloc[-1] > 0 else "停止")
 
-        # 绘图
-        st.divider()
-        st.subheader(f"📈 策略净值走势 ({start_d} 至 {end_d})")
-        
+        # --- 绘图 ---
         fig = go.Figure()
-
-        ma_line = nav.rolling(10).mean()
-        status = (nav >= ma_line).astype(int)
-        change_idx = np.where(status.diff().fillna(0) != 0)[0]
-        segs = np.concatenate(([0], change_idx, [len(nav)-1]))
-        for i in range(len(segs)-1):
-            cl = "rgba(0, 255, 136, 0.06)" if status.iloc[segs[i+1]] == 1 else "rgba(255, 68, 68, 0.06)"
-            fig.add_vrect(x0=nav.index[segs[i]], x1=nav.index[segs[i+1]], fillcolor=cl, line_width=0, layer="below")
-
-        fig.add_trace(go.Scatter(
-            x=nav.index, y=nav, name="动能策略", 
-            line=dict(color='#00ff88', width=3),
-            text=[f"持仓: {', '.join(h) if h else '空仓'}" for h in res_df['holdings']],
-            hoverinfo="x+y+text"
-        ))
-
-        re_dates = [res_df.index[i] for i in range(1, len(res_df)) if res_df['holdings'].iloc[i] != res_df['holdings'].iloc[i-1]]
-        fig.add_trace(go.Scatter(
-            x=re_dates, y=nav.loc[re_dates], mode='markers', name="调仓动作",
-            marker=dict(symbol='diamond', size=6, color='white', line=dict(width=1, color='#00ff88')),
-            hoverinfo="skip"
-        ))
-
+        fig.add_trace(go.Scatter(x=nav.index, y=nav, name="策略净值", line=dict(color='#00ff88', width=3)))
         for b_name in BENCHMARKS.values():
             if b_name in df.columns:
-                b_nav = df[b_name].loc[nav.index]
-                if not b_nav.empty:
-                    b_nav = b_nav / b_nav.iloc[0]
-                    fig.add_trace(go.Scatter(x=b_nav.index, y=b_nav, name=b_name, 
-                                             line=dict(dash='dot', width=1.2), opacity=0.6))
+                b_val = df[b_name].loc[nav.index]
+                fig.add_trace(go.Scatter(x=b_val.index, y=b_val/b_val.iloc[0], name=b_name, line=dict(dash='dot'), opacity=0.5))
+        st.plotly_chart(fig, use_container_width=True)
 
-        fig.update_layout(
-            template="plotly_dark", height=600, 
-            margin=dict(l=10, r=10, t=10, b=10),
-            hovermode="x unified",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-        )
-        st.plotly_chart(fig, width="stretch")
-
-        # 榜单
+        # --- 核心修改：智能信号分析榜单 ---
         st.divider()
-        st.subheader("📋 最新信号明细")
+        st.subheader("🔍 动量拐点雷达")
+        st.info("💡 解读：动能评分高+加速中=最强；动能高+减速=可能见顶；RSI>80=极度危险")
+
         if not score_df.empty:
-            l_scores, l_prices, l_mas = score_df.iloc[-1], df_trade.iloc[-1], ma_df.iloc[-1]
+            last_idx = -1
+            l_score = score_df.iloc[last_idx]
+            l_price = df_trade.iloc[last_idx]
+            l_ma = ma_df.iloc[last_idx]
+            l_acc = acc_df.iloc[last_idx]  # 加速度
+            l_rsi = rsi_df.iloc[last_idx]  # RSI
+
             ranks = []
-            for name in l_scores.index:
-                # 在榜单显示时，也要处理可能的 NaN
-                if pd.isna(l_scores[name]) or pd.isna(l_prices[name]):
-                    sig = "⚠️ 数据缺失"
-                    ranks.append({
-                        "名称": name, "动能评分": 0, "当前价格": 0, "均线止损": 0, "信号": sig
-                    })
+            for name in l_score.index:
+                if pd.isna(l_score[name]) or pd.isna(l_price[name]): continue
+                
+                # 基础信号
+                is_hold = (l_score[name] > 0) and (l_price[name] > l_ma[name])
+                
+                # 拐点分析逻辑
+                status_emoji = ""
+                status_text = ""
+                
+                # 1. 速度判断
+                if l_acc[name] > 0.02: # 短期比长期涨得快很多
+                    acc_status = "🚀 加速中"
+                elif l_acc[name] < -0.01: # 短期明显跑输长期
+                    acc_status = "🐢 动力衰竭"
                 else:
-                    price_ok = l_prices[name] > l_mas[name]
-                    score_ok = l_scores[name] > 0
-                    sig = "✅ 持有" if (score_ok and price_ok) else "❌ 空仓"
-                    
-                    ranks.append({
-                        "名称": name, 
-                        "动能评分": l_scores[name], 
-                        "当前价格": l_prices[name], 
-                        "均线止损": l_mas[name], 
-                        "信号": sig
-                    })
-            
+                    acc_status = "➡️ 匀速"
+                
+                # 2. 过热判断
+                rsi_val = l_rsi[name]
+                if rsi_val > 80:
+                    rsi_status = "🔥 严重超买"
+                elif rsi_val > 70:
+                    rsi_status = "⚠️ 偏高"
+                elif rsi_val < 30:
+                    rsi_status = "❄️ 超卖"
+                else:
+                    rsi_status = "✅ 正常"
+
+                # 综合建议
+                if is_hold:
+                    if rsi_val > 80:
+                        advice = "建议止盈 (过热)"
+                        color = "#ff4444" # 红
+                    elif l_acc[name] < -0.05:
+                        advice = "注意风险 (减速)"
+                        color = "#ffaa00" # 橙
+                    else:
+                        advice = "持有"
+                        color = "#00ff88" # 绿
+                else:
+                    advice = "空仓"
+                    color = "#777777" # 灰
+
+                ranks.append({
+                    "标的": name,
+                    "动能评分": l_score[name],
+                    "加速度": l_acc[name],
+                    "RSI(14)": rsi_val,
+                    "趋势状态": f"{acc_status} | {rsi_status}",
+                    "决策建议": advice,
+                    "_color": color 
+                })
+
             df_rank = pd.DataFrame(ranks).sort_values("动能评分", ascending=False)
             
+            # 使用 Pandas Styler 进行着色
+            def color_advice(val):
+                if "止盈" in val: return 'color: red; font-weight: bold'
+                if "风险" in val: return 'color: orange; font-weight: bold'
+                if "持有" in val: return 'color: #00ff88; font-weight: bold'
+                return 'color: gray'
+
             st.dataframe(
-                df_rank.style.format({"动能评分": "{:.2%}", "当前价格": "{:.3f}", "均线止损": "{:.3f}"})
-                .map(lambda x: 'color: #00ff88; font-weight: bold' if "✅" in str(x) else 'color: #ff4444', subset=['信号'])
-                .map(lambda x: 'color: #ffaa00' if isinstance(x, (int, float)) and x < 0 else 'color: #eeeeee', subset=['动能评分']),
-                width="stretch"
+                df_rank.style.format({
+                    "动能评分": "{:.2%}", "加速度": "{:.2%}", "RSI(14)": "{:.1f}"
+                })
+                .map(color_advice, subset=['决策建议'])
+                .bar(subset=['动能评分'], color='#3366cc', vmin=-0.2, vmax=0.2),
+                use_container_width=True,
+                height=500
             )
+
     else:
-        st.warning("⚠️ 所选时间段内数据不足，无法回测。")
+        st.warning("数据不足")
 else:
-    # 即使这里提示，其实也是因为 get_clean_data 返回了空，说明所有标的都失败了
-    # 但如果只有 501018 失败，是不会进入这里的，而是会进入正常回测
-    st.error("📡 所有标的数据获取失败，请检查网络或时间设置。")
+    st.error("无法获取数据")
