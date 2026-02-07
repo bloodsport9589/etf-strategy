@@ -45,94 +45,93 @@ def calculate_rsi_series(series, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50)
 
+# 将原本的 get_clean_data 函数完全替换为以下代码：
+
 @st.cache_data(ttl=3600)
 def get_clean_data(assets_dict, start_date, end_date):
     """
-    混合数据获取逻辑：
-    1. 国内标的 (数字开头) -> AkShare (东方财富接口，支持后复权，支持LOF)
-    2. 国际标的 (非数字开头) -> YFinance
+    全能容错版数据获取：
+    1. 优先尝试 AkShare (准确，后复权)
+    2. 如果 AkShare 失败/为空（云端常见），自动降级为 YFinance
+    3. 确保列名最终统一为中文名称
     """
     targets = {**assets_dict, **BENCHMARKS}
     
-    # 日期格式化适配 AkShare
-    s_date_str = (start_date - timedelta(days=365)).strftime("%Y%m%d")
+    # 扩大抓取范围，确保有足够的计算动量（Momentum）的“预热期”
+    fetch_start = start_date - timedelta(days=365) 
+    s_date_str = fetch_start.strftime("%Y%m%d")
     e_date_str = (end_date + timedelta(days=1)).strftime("%Y%m%d")
     
     combined_df = pd.DataFrame()
     
-    # 进度条 (因为 AkShare 是串行请求，需要反馈)
+    # 进度条
     progress_bar = st.progress(0)
     status_text = st.empty()
     total = len(targets)
     
     for i, (ticker, name) in enumerate(targets.items()):
-        status_text.text(f"正在获取数据 ({i+1}/{total}): {name}...")
+        status_text.text(f"正在获取 ({i+1}/{total}): {name}...")
         progress_bar.progress((i + 1) / total)
         
         series_data = None
         
-        try:
-            # --- 分支 A: 国内基金/股票 (AkShare) ---
-            if ticker[0].isdigit():
-                code = ticker.split('.')[0] # 去掉后缀
-                try:
-                    # 获取 ETF/LOF 历史数据 (后复权)
-                    df_ak = ak.fund_etf_hist_em(
-                        symbol=code, 
-                        period="daily", 
-                        start_date=s_date_str, 
-                        end_date=e_date_str, 
-                        adjust="hfq"
-                    )
-                    if not df_ak.empty:
-                        df_ak['date'] = pd.to_datetime(df_ak['日期'])
-                        df_ak.set_index('date', inplace=True)
-                        series_data = df_ak['收盘']
-                except:
-                    # 备用：如果是普通指数或股票
-                    try:
-                        df_ak = ak.stock_zh_a_hist(symbol=code, start_date=s_date_str, end_date=e_date_str, adjust="hfq")
-                        df_ak['date'] = pd.to_datetime(df_ak['日期'])
-                        df_ak.set_index('date', inplace=True)
-                        series_data = df_ak['收盘']
-                    except:
-                        pass
+        # ==========================================
+        # 尝试 1: AkShare (国内源，优先)
+        # ==========================================
+        if ticker[0].isdigit(): # 仅对数字开头的国内标的尝试 AkShare
+            try:
+                code = ticker.split('.')[0]
+                # 尝试 ETF/LOF 接口
+                df_ak = ak.fund_etf_hist_em(
+                    symbol=code, period="daily", start_date=s_date_str, end_date=e_date_str, adjust="hfq"
+                )
+                if not df_ak.empty:
+                    df_ak['date'] = pd.to_datetime(df_ak['日期'])
+                    df_ak.set_index('date', inplace=True)
+                    series_data = df_ak['收盘']
+            except:
+                pass # AkShare 失败，静默进入下一步
 
-            # --- 分支 B: 国际指数 (YFinance) ---
-            else:
-                # 针对 ^GSPC 等
-                df_yf = yf.download(ticker, start=start_date - timedelta(days=365), end=end_date + timedelta(days=1), progress=False)
+        # ==========================================
+        # 尝试 2: YFinance (国际源，备用/降级)
+        # ==========================================
+        # 如果 AkShare 没拿到数据，或者是非国内标的，使用 YFinance
+        if series_data is None or series_data.empty:
+            try:
+                # 针对 501018 这种 Yahoo 没有的，这一步也会失败，但不会报错
+                df_yf = yf.download(ticker, start=fetch_start, end=end_date + timedelta(days=1), progress=False)
+                
                 if not df_yf.empty:
-                    # 处理 MultiIndex
                     if isinstance(df_yf.columns, pd.MultiIndex):
                         try:
                             series_data = df_yf[('Adj Close', ticker)]
                         except:
-                            series_data = df_yf.iloc[:, 0] # 盲取第一列
+                            series_data = df_yf.iloc[:, 0] # 强制取第一列
                     else:
                         series_data = df_yf['Adj Close'] if 'Adj Close' in df_yf.columns else df_yf['Close']
                     
-                    # 关键：去除时区，否则无法与 AkShare 数据合并
+                    # 去除时区
                     if series_data.index.tz is not None:
                         series_data.index = series_data.index.tz_localize(None)
+            except Exception as e:
+                print(f"Yahoo fetch failed for {ticker}: {e}")
 
-            # --- 数据合并 ---
-            if series_data is not None and not series_data.empty:
-                series_data.name = ticker # 恢复原始 key 名字
-                combined_df = pd.merge(combined_df, series_data, left_index=True, right_index=True, how='outer')
-                
-        except Exception as e:
-            print(f"Error fetching {ticker}: {e}")
-            continue
-
+        # ==========================================
+        # 数据合并
+        # ==========================================
+        if series_data is not None and not series_data.empty:
+            # 关键修正：直接在这里把列名改成中文名称！
+            # 这样避免后续 rename 失败导致找不到列
+            series_data.name = name 
+            combined_df = pd.merge(combined_df, series_data, left_index=True, right_index=True, how='outer')
+    
     progress_bar.empty()
     status_text.empty()
-    
-    if combined_df.empty: return pd.DataFrame()
 
-    # 清洗：重命名 -> 排序 -> 填充 -> 去空
-    rename_map = {k: v for k, v in targets.items() if k in combined_df.columns}
-    combined_df = combined_df.rename(columns=rename_map)
+    if combined_df.empty:
+        return pd.DataFrame()
+
+    # 简单清洗
     combined_df = combined_df.sort_index().ffill().dropna(how='all')
     
     return combined_df
