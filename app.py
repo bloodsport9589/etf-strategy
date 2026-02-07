@@ -1,5 +1,6 @@
 import streamlit as st
 import yfinance as yf
+import akshare as ak  # 核心新增：用于获取国内准确数据
 import pandas as pd
 import datetime
 import plotly.graph_objects as go
@@ -7,24 +8,25 @@ import numpy as np
 from datetime import timedelta
 
 # ================= 1. 基础配置 =================
-st.set_page_config(page_title="全球动能工厂-持仓透视版", page_icon="🏭", layout="wide")
+st.set_page_config(page_title="全球动能工厂-混合数据版", page_icon="🏭", layout="wide")
 
 # 初始化参数
 DEFAULTS = {
     "rs": 20, "rl": 60, "rw": 100, "h": 1, "m": 20,
     "rsi_period": 14, 
-    "rsi_limit": 80,   
+    "rsi_limit": 80,    
     "acc_limit": -0.05 
 }
 for key, val in DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
+# 默认资产池 (包含南方原油 501018)
 DEFAULT_ASSETS = {
     "513100.SS": "纳指ETF", "513520.SS": "日经ETF", "513180.SS": "恒生科技",
     "510180.SS": "上证180", "159915.SZ": "创业板指", "518880.SS": "黄金ETF",
     "512400.SS": "有色ETF", "159981.SZ": "豆粕ETF", "588050.SS": "科创50",
-    "501018.SS": "南方原油",
+    "501018.SS": "南方原油", # 此标的现在将通过 AkShare 获取
 }
 BENCHMARKS = {"510300.SS": "沪深300", "^GSPC": "标普500"}
 
@@ -45,37 +47,95 @@ def calculate_rsi_series(series, period=14):
 
 @st.cache_data(ttl=3600)
 def get_clean_data(assets_dict, start_date, end_date):
+    """
+    混合数据获取逻辑：
+    1. 国内标的 (数字开头) -> AkShare (东方财富接口，支持后复权，支持LOF)
+    2. 国际标的 (非数字开头) -> YFinance
+    """
     targets = {**assets_dict, **BENCHMARKS}
-    fetch_start = start_date - timedelta(days=365)
-    fetch_end = end_date + timedelta(days=1)
     
-    try:
-        data = yf.download(list(targets.keys()), start=fetch_start, end=fetch_end, progress=False, group_by='ticker')
-        if data.empty: return pd.DataFrame()
-        clean_data = pd.DataFrame()
-        for ticker in targets.keys():
-            try:
-                if isinstance(data.columns, pd.MultiIndex) and ticker in data.columns.levels[0]:
-                    col_data = data[ticker]
-                elif ticker in data.columns:
-                    col_data = data[[ticker]]
-                else:
-                    continue
-                
-                if 'Adj Close' in col_data.columns: s = col_data['Adj Close']
-                elif 'Close' in col_data.columns: s = col_data['Close']
-                else: s = col_data.iloc[:, 0]
-                
-                if s.dropna().empty: continue 
-                clean_data[ticker] = s
-            except: continue 
+    # 日期格式化适配 AkShare
+    s_date_str = (start_date - timedelta(days=365)).strftime("%Y%m%d")
+    e_date_str = (end_date + timedelta(days=1)).strftime("%Y%m%d")
+    
+    combined_df = pd.DataFrame()
+    
+    # 进度条 (因为 AkShare 是串行请求，需要反馈)
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    total = len(targets)
+    
+    for i, (ticker, name) in enumerate(targets.items()):
+        status_text.text(f"正在获取数据 ({i+1}/{total}): {name}...")
+        progress_bar.progress((i + 1) / total)
         
-        if clean_data.empty: return pd.DataFrame()
-        rename_map = {k: v for k, v in targets.items() if k in clean_data.columns}
-        clean_data = clean_data.rename(columns=rename_map).ffill().dropna(how='all')
-        clean_data.index = clean_data.index.tz_localize(None)
-        return clean_data
-    except: return pd.DataFrame()
+        series_data = None
+        
+        try:
+            # --- 分支 A: 国内基金/股票 (AkShare) ---
+            if ticker[0].isdigit():
+                code = ticker.split('.')[0] # 去掉后缀
+                try:
+                    # 获取 ETF/LOF 历史数据 (后复权)
+                    df_ak = ak.fund_etf_hist_em(
+                        symbol=code, 
+                        period="daily", 
+                        start_date=s_date_str, 
+                        end_date=e_date_str, 
+                        adjust="hfq"
+                    )
+                    if not df_ak.empty:
+                        df_ak['date'] = pd.to_datetime(df_ak['日期'])
+                        df_ak.set_index('date', inplace=True)
+                        series_data = df_ak['收盘']
+                except:
+                    # 备用：如果是普通指数或股票
+                    try:
+                        df_ak = ak.stock_zh_a_hist(symbol=code, start_date=s_date_str, end_date=e_date_str, adjust="hfq")
+                        df_ak['date'] = pd.to_datetime(df_ak['日期'])
+                        df_ak.set_index('date', inplace=True)
+                        series_data = df_ak['收盘']
+                    except:
+                        pass
+
+            # --- 分支 B: 国际指数 (YFinance) ---
+            else:
+                # 针对 ^GSPC 等
+                df_yf = yf.download(ticker, start=start_date - timedelta(days=365), end=end_date + timedelta(days=1), progress=False)
+                if not df_yf.empty:
+                    # 处理 MultiIndex
+                    if isinstance(df_yf.columns, pd.MultiIndex):
+                        try:
+                            series_data = df_yf[('Adj Close', ticker)]
+                        except:
+                            series_data = df_yf.iloc[:, 0] # 盲取第一列
+                    else:
+                        series_data = df_yf['Adj Close'] if 'Adj Close' in df_yf.columns else df_yf['Close']
+                    
+                    # 关键：去除时区，否则无法与 AkShare 数据合并
+                    if series_data.index.tz is not None:
+                        series_data.index = series_data.index.tz_localize(None)
+
+            # --- 数据合并 ---
+            if series_data is not None and not series_data.empty:
+                series_data.name = ticker # 恢复原始 key 名字
+                combined_df = pd.merge(combined_df, series_data, left_index=True, right_index=True, how='outer')
+                
+        except Exception as e:
+            print(f"Error fetching {ticker}: {e}")
+            continue
+
+    progress_bar.empty()
+    status_text.empty()
+    
+    if combined_df.empty: return pd.DataFrame()
+
+    # 清洗：重命名 -> 排序 -> 填充 -> 去空
+    rename_map = {k: v for k, v in targets.items() if k in combined_df.columns}
+    combined_df = combined_df.rename(columns=rename_map)
+    combined_df = combined_df.sort_index().ffill().dropna(how='all')
+    
+    return combined_df
 
 # ================= 3. 策略回测引擎 =================
 def run_strategy_engine(df_all, assets, params, user_start_date, 
@@ -182,7 +242,7 @@ params = {
 }
 
 # ================= 5. 主界面 =================
-st.title("🧪 动能工厂 - 持仓透视实验室")
+st.title("🧪 动能工厂 - 持仓透视实验室 (混合数据版)")
 
 df = get_clean_data(st.session_state.my_assets, start_d, end_d)
 
@@ -310,4 +370,4 @@ if not df.empty:
                 }
             )
 else:
-    st.error("无法获取数据")
+    st.error("无法获取数据，请检查网络或 AkShare 接口状态")
