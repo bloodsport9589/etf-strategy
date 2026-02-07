@@ -241,22 +241,51 @@ params = {
     "rsi_period": 14, "rsi_limit": rsi_limit, "acc_limit": acc_limit
 }
 
-# ================= 5. 主界面 =================
-st.title("🧪 动能工厂 - 持仓透视实验室 (混合数据版)")
+# ================= 5. 主界面 (诊断增强版) =================
+st.title("🧪 动能工厂 - 持仓透视实验室 (调试版)")
 
+# 添加一个调试开关
+debug_mode = st.checkbox("🐞 开启调试模式 (如果没图表请勾选此项)", value=True)
+
+if debug_mode:
+    st.info(f"正在获取数据... 时间范围: {start_d} 到 {end_d}")
+
+# 1. 获取数据
 df = get_clean_data(st.session_state.my_assets, start_d, end_d)
 
-if not df.empty:
+# --- 诊断点 A: 检查数据是否为空 ---
+if df.empty:
+    st.error("❌ 错误：无法获取任何数据。可能是网络问题或 AkShare/YFinance 在云端被拦截。")
+else:
+    if debug_mode:
+        st.success(f"✅ 成功获取数据! 数据形状: {df.shape}")
+        st.write("📊 原始数据前 3 行预览:", df.head(3))
+        st.write("📋 包含的列名:", df.columns.tolist())
+
+    # 2. 运行策略
     with st.spinner("正在进行双轨回测..."):
         res_base = run_strategy_engine(df, st.session_state.my_assets, params, start_d, False, False)
         res_new = run_strategy_engine(df, st.session_state.my_assets, params, start_d, use_rsi, use_acc)
 
-    if res_base and res_new:
+    # --- 诊断点 B: 检查策略计算结果 ---
+    if res_base is None or res_new is None:
+        st.warning("⚠️ 警告：策略计算返回了空值。原因可能是：")
+        st.markdown("""
+        1. **数据长度不足**：你设置的“长期周期(Slow)”是 60 天，加上“风控均线”20 天，至少需要 80+ 天的历史数据。
+        2. **列名匹配失败**：请检查上面预览的列名是否是中文名称（如“纳指ETF”）。
+        3. **所有信号均为空**：可能是数据全是 NaN。
+        """)
+        if res_base is None: st.write("❌ 原始策略结果为 None")
+        if res_new is None: st.write("❌ 新策略结果为 None")
+    
+    # 3. 如果策略成功，则绘图
+    else:
         nav_base = res_base['res']['nav']
         nav_new = res_new['res']['nav']
         
         # --- 顶部数据 ---
         def calc_metrics(nav):
+            if len(nav) < 2: return 0, 0, 0 # 防止数据太少报错
             ret = nav.iloc[-1] - 1
             mdd = ((nav - nav.cummax()) / nav.cummax()).min()
             dr = nav.pct_change().dropna()
@@ -270,7 +299,10 @@ if not df.empty:
         c1.metric("累计收益 (优化后)", f"{rn:.2%}", delta=f"{rn-rb:.2%}")
         c2.metric("最大回撤", f"{mn:.2%}", delta=f"{mn-mb:.2%}", delta_color="inverse")
         c3.metric("夏普比率", f"{sn:.2f}", delta=f"{sn-sb:.2f}")
-        c4.metric("当前策略持仓", ", ".join(res_new['res']['holdings'].iloc[-1]) if res_new['res']['holdings'].iloc[-1] else "空仓")
+        
+        # 安全获取持仓
+        last_holdings = res_new['res']['holdings'].iloc[-1] if not res_new['res'].empty else []
+        c4.metric("当前策略持仓", ", ".join(last_holdings) if last_holdings else "空仓")
 
         # --- 图表区 ---
         tab1, tab2 = st.tabs(["📈 净值曲线", "🧬 详细持仓诊断"])
@@ -284,90 +316,87 @@ if not df.empty:
 
         with tab2:
             st.markdown("#### 🔎 截止回测结束日的持仓快照")
-            st.caption("下表展示了所有标的的状态，以及**为什么**它们被买入或被剔除。")
             
             # 获取最后一天的数据
-            last_idx = -1
-            r_score = res_new['raw_scores'].iloc[last_idx]
-            r_price = res_new['raw_prices'].iloc[last_idx]
-            r_ma = res_new['raw_ma'].iloc[last_idx]
-            r_rsi = res_new['raw_rsi'].iloc[last_idx]
-            r_acc = res_new['raw_acc'].iloc[last_idx]
-            
-            # 获取真实的持仓列表 (这是最关键的修正)
-            real_holdings = res_new['res']['holdings'].iloc[last_idx]
-            
-            snapshot = []
-            for name in r_score.index:
-                if pd.isna(r_score[name]) or pd.isna(r_price[name]): continue
+            if not res_new['raw_scores'].empty:
+                last_idx = -1
+                r_score = res_new['raw_scores'].iloc[last_idx]
+                r_price = res_new['raw_prices'].iloc[last_idx]
+                r_ma = res_new['raw_ma'].iloc[last_idx]
+                r_rsi = res_new['raw_rsi'].iloc[last_idx]
+                r_acc = res_new['raw_acc'].iloc[last_idx]
                 
-                # 1. 基础硬指标
-                is_above_ma = r_price[name] > r_ma[name]
-                is_pos_score = r_score[name] > 0
+                real_holdings = res_new['res']['holdings'].iloc[last_idx]
                 
-                # 2. 软过滤指标
-                rsi_ok = r_rsi[name] < rsi_limit
-                acc_ok = r_acc[name] > acc_limit
-                
-                # 3. 判定状态
-                if name in real_holdings:
-                    status = "✅ 实际持仓"
-                    reason = "综合排名第一且满足所有条件"
-                    color_code = 1 # 绿
-                else:
-                    # 如果没持仓，分析原因
-                    if not is_pos_score:
-                        status = "⚪ 落选"
-                        reason = "动能评分为负"
-                        color_code = 0
-                    elif not is_above_ma:
-                        status = "⚪ 落选"
-                        reason = "价格跌破均线"
-                        color_code = 0
-                    elif use_rsi and not rsi_ok:
-                        status = "⛔ 熔断剔除"
-                        reason = f"RSI({r_rsi[name]:.1f}) 超标"
-                        color_code = -1 # 红
-                    elif use_acc and not acc_ok:
-                        status = "⛔ 熔断剔除"
-                        reason = f"加速度({r_acc[name]:.1%}) 衰竭"
-                        color_code = -1
+                snapshot = []
+                for name in r_score.index:
+                    if name not in r_price.index or pd.isna(r_score[name]): continue
+                    
+                    # 1. 基础硬指标
+                    is_above_ma = r_price[name] > r_ma[name]
+                    is_pos_score = r_score[name] > 0
+                    
+                    # 2. 软过滤指标
+                    rsi_ok = r_rsi[name] < rsi_limit
+                    acc_ok = r_acc[name] > acc_limit
+                    
+                    # 3. 判定状态
+                    if name in real_holdings:
+                        status = "✅ 实际持仓"
+                        reason = "综合排名第一且满足所有条件"
+                        color_code = 1 
                     else:
-                        # 分数是正的，也没熔断，但没买 -> 说明排名不够高
-                        status = "⚠️ 备选"
-                        reason = "符合条件，但分数不是最高"
-                        color_code = 2 # 黄
-                        
-                        # 特殊情况提示：如果没开启过滤，但指标很差
-                        if (not use_rsi and not rsi_ok) or (not use_acc and not acc_ok):
-                            reason += " (注意：指标已报警但未开启过滤)"
+                        if not is_pos_score:
+                            status = "⚪ 落选"
+                            reason = "动能评分为负"
+                            color_code = 0
+                        elif not is_above_ma:
+                            status = "⚪ 落选"
+                            reason = "价格跌破均线"
+                            color_code = 0
+                        elif use_rsi and not rsi_ok:
+                            status = "⛔ 熔断剔除"
+                            reason = f"RSI({r_rsi[name]:.1f}) 超标"
+                            color_code = -1 
+                        elif use_acc and not acc_ok:
+                            status = "⛔ 熔断剔除"
+                            reason = f"加速度({r_acc[name]:.1%}) 衰竭"
+                            color_code = -1
+                        else:
+                            status = "⚠️ 备选"
+                            reason = "符合条件，但分数不是最高"
+                            color_code = 2 
+                            
+                            if (not use_rsi and not rsi_ok) or (not use_acc and not acc_ok):
+                                reason += " (注意：指标已报警但未开启过滤)"
 
-                snapshot.append({
-                    "标的": name,
-                    "动能评分": r_score[name],
-                    "加速度": r_acc[name],
-                    "RSI": r_rsi[name],
-                    "🏛️ 实际持仓": status,
-                    "📋 判定原因": reason,
-                    "_code": color_code
-                })
-            
-            df_snap = pd.DataFrame(snapshot).sort_values("动能评分", ascending=False)
-            
-            def color_row(val):
-                if "持仓" in val: return 'color: #00ff88; font-weight: bold; background-color: rgba(0,255,136,0.1)'
-                if "熔断" in val: return 'color: #ff4444; font-weight: bold'
-                if "备选" in val: return 'color: #ffcc00'
-                return 'color: gray'
+                    snapshot.append({
+                        "标的": name,
+                        "动能评分": r_score[name],
+                        "加速度": r_acc[name],
+                        "RSI": r_rsi[name],
+                        "🏛️ 实际持仓": status,
+                        "📋 判定原因": reason,
+                        "_code": color_code
+                    })
+                
+                if snapshot:
+                    df_snap = pd.DataFrame(snapshot).sort_values("动能评分", ascending=False)
+                    
+                    def color_row(val):
+                        if "持仓" in val: return 'color: #00ff88; font-weight: bold; background-color: rgba(0,255,136,0.1)'
+                        if "熔断" in val: return 'color: #ff4444; font-weight: bold'
+                        if "备选" in val: return 'color: #ffcc00'
+                        return 'color: gray'
 
-            st.dataframe(
-                df_snap.style.format({"动能评分": "{:.2%}", "加速度": "{:.2%}", "RSI": "{:.1f}"})
-                .map(color_row, subset=['🏛️ 实际持仓']),
-                use_container_width=True,
-                height=600,
-                column_config={
-                    "_code": None # 隐藏辅助列
-                }
-            )
-else:
-    st.error("无法获取数据，请检查网络或 AkShare 接口状态")
+                    st.dataframe(
+                        df_snap.style.format({"动能评分": "{:.2%}", "加速度": "{:.2%}", "RSI": "{:.1f}"})
+                        .map(color_row, subset=['🏛️ 实际持仓']),
+                        use_container_width=True,
+                        height=600,
+                        column_config={"_code": None}
+                    )
+                else:
+                    st.info("没有生成快照数据")
+            else:
+                st.warning("结果集为空，无法显示详细诊断")
