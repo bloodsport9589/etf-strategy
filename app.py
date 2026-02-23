@@ -21,12 +21,12 @@ for key, val in DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
-# 默认资产池 (包含南方原油 501018)
+# 默认资产池
 DEFAULT_ASSETS = {
     "513100.SS": "纳指ETF", "513520.SS": "日经ETF", "513180.SS": "恒生科技",
     "510180.SS": "上证180", "159915.SZ": "创业板指", "518880.SS": "黄金ETF",
     "512400.SS": "有色ETF", "159981.SZ": "豆粕ETF", "588050.SS": "科创50",
-    "USO": "原油", # 此标的现在将通过 AkShare 获取
+    "USO": "原油", 
 }
 BENCHMARKS = {"510300.SS": "沪深300", "^GSPC": "标普500"}
 
@@ -45,26 +45,24 @@ def calculate_rsi_series(series, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50)
 
-# 将原本的 get_clean_data 函数完全替换为以下代码：
 
 @st.cache_data(ttl=3600)
 def get_clean_data(assets_dict, start_date, end_date):
     """
     全能容错版数据获取：
     1. 优先尝试 AkShare (准确，后复权)
-    2. 如果 AkShare 失败/为空（云端常见），自动降级为 YFinance
+    2. 如果 AkShare 失败/为空，自动降级为 YFinance
     3. 确保列名最终统一为中文名称
+    4. 强制对齐A股日历，剔除假期冗余数据
     """
     targets = {**assets_dict, **BENCHMARKS}
     
-    # 扩大抓取范围，确保有足够的计算动量（Momentum）的“预热期”
     fetch_start = start_date - timedelta(days=365) 
     s_date_str = fetch_start.strftime("%Y%m%d")
     e_date_str = (end_date + timedelta(days=1)).strftime("%Y%m%d")
     
     combined_df = pd.DataFrame()
     
-    # 进度条
     progress_bar = st.progress(0)
     status_text = st.empty()
     total = len(targets)
@@ -75,13 +73,10 @@ def get_clean_data(assets_dict, start_date, end_date):
         
         series_data = None
         
-        # ==========================================
         # 尝试 1: AkShare (国内源，优先)
-        # ==========================================
-        if ticker[0].isdigit(): # 仅对数字开头的国内标的尝试 AkShare
+        if ticker[0].isdigit(): 
             try:
                 code = ticker.split('.')[0]
-                # 尝试 ETF/LOF 接口
                 df_ak = ak.fund_etf_hist_em(
                     symbol=code, period="daily", start_date=s_date_str, end_date=e_date_str, adjust="hfq"
                 )
@@ -90,15 +85,11 @@ def get_clean_data(assets_dict, start_date, end_date):
                     df_ak.set_index('date', inplace=True)
                     series_data = df_ak['收盘']
             except:
-                pass # AkShare 失败，静默进入下一步
+                pass 
 
-        # ==========================================
         # 尝试 2: YFinance (国际源，备用/降级)
-        # ==========================================
-        # 如果 AkShare 没拿到数据，或者是非国内标的，使用 YFinance
         if series_data is None or series_data.empty:
             try:
-                # 针对 501018 这种 Yahoo 没有的，这一步也会失败，但不会报错
                 df_yf = yf.download(ticker, start=fetch_start, end=end_date + timedelta(days=1), progress=False)
                 
                 if not df_yf.empty:
@@ -106,22 +97,17 @@ def get_clean_data(assets_dict, start_date, end_date):
                         try:
                             series_data = df_yf[('Adj Close', ticker)]
                         except:
-                            series_data = df_yf.iloc[:, 0] # 强制取第一列
+                            series_data = df_yf.iloc[:, 0] 
                     else:
                         series_data = df_yf['Adj Close'] if 'Adj Close' in df_yf.columns else df_yf['Close']
                     
-                    # 去除时区
                     if series_data.index.tz is not None:
                         series_data.index = series_data.index.tz_localize(None)
             except Exception as e:
                 print(f"Yahoo fetch failed for {ticker}: {e}")
 
-        # ==========================================
         # 数据合并
-        # ==========================================
         if series_data is not None and not series_data.empty:
-            # 关键修正：直接在这里把列名改成中文名称！
-            # 这样避免后续 rename 失败导致找不到列
             series_data.name = name 
             combined_df = pd.merge(combined_df, series_data, left_index=True, right_index=True, how='outer')
     
@@ -131,7 +117,16 @@ def get_clean_data(assets_dict, start_date, end_date):
     if combined_df.empty:
         return pd.DataFrame()
 
-    # 简单清洗
+    # ==========================================
+    # 主日历对齐过滤（宏观规避节假日/周末）
+    # ==========================================
+    hs300_name = BENCHMARKS.get("510300.SS", "沪深300")
+    if hs300_name in combined_df.columns:
+        # 只保留沪深300有真实交易记录的日子，彻底干掉周末和A股节假日
+        valid_a_share_dates = combined_df[hs300_name].dropna().index
+        combined_df = combined_df.loc[valid_a_share_dates]
+
+    # 向前填充停牌日的缺失值并清理空行
     combined_df = combined_df.sort_index().ffill().dropna(how='all')
     
     return combined_df
@@ -159,18 +154,27 @@ def run_strategy_engine(df_all, assets, params, user_start_date,
     ma = df_t.rolling(m).mean()
     rets = df_t.pct_change()
     
+    # ==========================================
+    # 微观停牌检测器
+    # 逻辑：价格无波动判定为停牌/无交易，屏蔽其买入资格
+    # ==========================================
+    is_tradeable = (df_t.diff() != 0).fillna(True) 
+    
     warm_up = max(rs, rl, m, rsi_p)
     nav = np.ones(len(df_t))
     hist = [[] for _ in range(len(df_t))]
     
     s_vals, p_vals, m_vals = scores.values, df_t.values, ma.values
     r_vals, rsi_vals, acc_vals = rets.values, rsi_df.values, acc_df.values
+    t_vals = is_tradeable.values
     
     filter_stats = {"rsi_triggered": 0, "acc_triggered": 0}
 
     for i in range(warm_up, len(df_t) - 1):
         valid_data = np.isfinite(s_vals[i]) & np.isfinite(p_vals[i]) & np.isfinite(m_vals[i])
-        base_signal = (s_vals[i] > 0) & (p_vals[i] > m_vals[i])
+        
+        # 加入 t_vals[i] 判断，停牌标的当天直接失去买入资格
+        base_signal = (s_vals[i] > 0) & (p_vals[i] > m_vals[i]) & t_vals[i]
         
         pass_rsi = (rsi_vals[i] < rsi_limit) if use_rsi_filter else True
         pass_acc = (acc_vals[i] > acc_limit) if use_acc_filter else True
@@ -209,7 +213,8 @@ def run_strategy_engine(df_all, assets, params, user_start_date,
         "raw_prices": df_t.loc[mask_slice],
         "raw_rsi": rsi_df.loc[mask_slice],
         "raw_acc": acc_df.loc[mask_slice],
-        "raw_ma": ma.loc[mask_slice]
+        "raw_ma": ma.loc[mask_slice],
+        "raw_tradeable": is_tradeable.loc[mask_slice] # 输出停牌状态
     }
 
 # ================= 4. UI 侧边栏 =================
@@ -243,7 +248,6 @@ params = {
 # ================= 5. 主界面 (诊断增强版) =================
 st.title("🧪 动能工厂 - 持仓透视实验室 (调试版)")
 
-# 添加一个调试开关
 debug_mode = st.checkbox("🐞 开启调试模式 (如果没图表请勾选此项)", value=True)
 
 if debug_mode:
@@ -252,7 +256,6 @@ if debug_mode:
 # 1. 获取数据
 df = get_clean_data(st.session_state.my_assets, start_d, end_d)
 
-# --- 诊断点 A: 检查数据是否为空 ---
 if df.empty:
     st.error("❌ 错误：无法获取任何数据。可能是网络问题或 AkShare/YFinance 在云端被拦截。")
 else:
@@ -266,14 +269,8 @@ else:
         res_base = run_strategy_engine(df, st.session_state.my_assets, params, start_d, False, False)
         res_new = run_strategy_engine(df, st.session_state.my_assets, params, start_d, use_rsi, use_acc)
 
-    # --- 诊断点 B: 检查策略计算结果 ---
     if res_base is None or res_new is None:
-        st.warning("⚠️ 警告：策略计算返回了空值。原因可能是：")
-        st.markdown("""
-        1. **数据长度不足**：你设置的“长期周期(Slow)”是 60 天，加上“风控均线”20 天，至少需要 80+ 天的历史数据。
-        2. **列名匹配失败**：请检查上面预览的列名是否是中文名称（如“纳指ETF”）。
-        3. **所有信号均为空**：可能是数据全是 NaN。
-        """)
+        st.warning("⚠️ 警告：策略计算返回了空值。")
         if res_base is None: st.write("❌ 原始策略结果为 None")
         if res_new is None: st.write("❌ 新策略结果为 None")
     
@@ -282,9 +279,8 @@ else:
         nav_base = res_base['res']['nav']
         nav_new = res_new['res']['nav']
         
-        # --- 顶部数据 ---
         def calc_metrics(nav):
-            if len(nav) < 2: return 0, 0, 0 # 防止数据太少报错
+            if len(nav) < 2: return 0, 0, 0 
             ret = nav.iloc[-1] - 1
             mdd = ((nav - nav.cummax()) / nav.cummax()).min()
             dr = nav.pct_change().dropna()
@@ -299,11 +295,9 @@ else:
         c2.metric("最大回撤", f"{mn:.2%}", delta=f"{mn-mb:.2%}", delta_color="inverse")
         c3.metric("夏普比率", f"{sn:.2f}", delta=f"{sn-sb:.2f}")
         
-        # 安全获取持仓
         last_holdings = res_new['res']['holdings'].iloc[-1] if not res_new['res'].empty else []
         c4.metric("当前策略持仓", ", ".join(last_holdings) if last_holdings else "空仓")
 
-        # --- 图表区 ---
         tab1, tab2 = st.tabs(["📈 净值曲线", "🧬 详细持仓诊断"])
         
         with tab1:
@@ -316,7 +310,6 @@ else:
         with tab2:
             st.markdown("#### 🔎 截止回测结束日的持仓快照")
             
-            # 获取最后一天的数据
             if not res_new['raw_scores'].empty:
                 last_idx = -1
                 r_score = res_new['raw_scores'].iloc[last_idx]
@@ -324,6 +317,7 @@ else:
                 r_ma = res_new['raw_ma'].iloc[last_idx]
                 r_rsi = res_new['raw_rsi'].iloc[last_idx]
                 r_acc = res_new['raw_acc'].iloc[last_idx]
+                r_trad = res_new['raw_tradeable'].iloc[last_idx]
                 
                 real_holdings = res_new['res']['holdings'].iloc[last_idx]
                 
@@ -331,16 +325,17 @@ else:
                 for name in r_score.index:
                     if name not in r_price.index or pd.isna(r_score[name]): continue
                     
-                    # 1. 基础硬指标
                     is_above_ma = r_price[name] > r_ma[name]
                     is_pos_score = r_score[name] > 0
-                    
-                    # 2. 软过滤指标
                     rsi_ok = r_rsi[name] < rsi_limit
                     acc_ok = r_acc[name] > acc_limit
                     
-                    # 3. 判定状态
-                    if name in real_holdings:
+                    # 判定状态（优先判断停牌）
+                    if not r_trad[name]:
+                        status = "🚫 停牌熔断"
+                        reason = "监测到价格无波动，判定停牌或未交易"
+                        color_code = -2
+                    elif name in real_holdings:
                         status = "✅ 实际持仓"
                         reason = "综合排名第一且满足所有条件"
                         color_code = 1 
@@ -354,11 +349,11 @@ else:
                             reason = "价格跌破均线"
                             color_code = 0
                         elif use_rsi and not rsi_ok:
-                            status = "⛔ 熔断剔除"
+                            status = "⛔ 指标剔除"
                             reason = f"RSI({r_rsi[name]:.1f}) 超标"
                             color_code = -1 
                         elif use_acc and not acc_ok:
-                            status = "⛔ 熔断剔除"
+                            status = "⛔ 指标剔除"
                             reason = f"加速度({r_acc[name]:.1%}) 衰竭"
                             color_code = -1
                         else:
@@ -384,7 +379,8 @@ else:
                     
                     def color_row(val):
                         if "持仓" in val: return 'color: #00ff88; font-weight: bold; background-color: rgba(0,255,136,0.1)'
-                        if "熔断" in val: return 'color: #ff4444; font-weight: bold'
+                        if "指标剔除" in val: return 'color: #ff4444; font-weight: bold'
+                        if "停牌" in val: return 'color: #ffaa00; font-weight: bold; background-color: rgba(255,170,0,0.1)'
                         if "备选" in val: return 'color: #ffcc00'
                         return 'color: gray'
 
