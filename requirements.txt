@@ -4,3 +4,4 @@ akshare
 pandas
 plotly
 numpy
+matplotlib
