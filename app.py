@@ -169,26 +169,32 @@ def run_strategy_engine(df_all, assets, params, user_start_date, use_rsi_filter=
     }
 
 # ================= 3. 自动网格寻优引擎 =================
-def run_grid_search(df_all, assets_dict, start_d):
-    """遍历寻找夏普比率高原"""
-    rs_list = [10, 15, 20, 25, 30]
+def run_grid_search(df_all, assets_dict, start_d, base_params):
+    """遍历寻找夏普比率高原，引入熔断因子的开关测试"""
+    rs_list = [15, 20, 25]  
     rl_list = [60, 120]
-    m_list = [20, 60]
+    
+    # 引入熔断开关的遍历 (开启 vs 不开启)
+    use_rsi_list = [False, True]
+    use_acc_list = [False, True]
     
     results = []
-    combinations = list(itertools.product(rs_list, rl_list, m_list))
+    # 4 个维度的全排列组合
+    combinations = list(itertools.product(rs_list, rl_list, use_rsi_list, use_acc_list))
     
     progress = st.progress(0)
     status = st.empty()
     
-    for i, (test_rs, test_rl, test_m) in enumerate(combinations):
-        status.text(f"正在回测参数组合 ({i+1}/{len(combinations)}): 短期={test_rs}, 长期={test_rl}, 均线={test_m}")
-        test_params = {
-            "rs": test_rs, "rl": test_rl, "rw": 1.0, "h": 1, "m": test_m,
-            "rsi_period": 14, "rsi_limit": 80, "acc_limit": -0.05
-        }
+    for i, (test_rs, test_rl, test_use_rsi, test_use_acc) in enumerate(combinations):
+        status.text(f"正在回测 ({i+1}/{len(combinations)}): 短期={test_rs}, 长期={test_rl}, RSI熔断={test_use_rsi}, 加速度过滤={test_use_acc}")
         
-        res = run_strategy_engine(df_all, assets_dict, test_params, start_d)
+        test_params = base_params.copy()
+        test_params.update({"rs": test_rs, "rl": test_rl})
+        
+        res = run_strategy_engine(
+            df_all, assets_dict, test_params, start_d, 
+            use_rsi_filter=test_use_rsi, use_acc_filter=test_use_acc
+        )
         
         if res is not None:
             nav = res['res']['nav']
@@ -199,8 +205,13 @@ def run_grid_search(df_all, assets_dict, start_d):
                 shp = (dr.mean()*252)/(dr.std()*np.sqrt(252)) if dr.std()!=0 else 0
                 
                 results.append({
-                    "短期(rs)": test_rs, "长期(rl)": test_rl, "风控均线(m)": test_m,
-                    "累计收益": ret, "最大回撤": mdd, "夏普比率": shp
+                    "短期(rs)": test_rs, 
+                    "长期(rl)": test_rl, 
+                    "RSI熔断": "✅" if test_use_rsi else "❌",
+                    "加速衰竭过滤": "✅" if test_use_acc else "❌",
+                    "累计收益": ret, 
+                    "最大回撤": mdd, 
+                    "夏普比率": shp
                 })
         progress.progress((i + 1) / len(combinations))
         
@@ -246,7 +257,6 @@ df = get_clean_data(st.session_state.my_assets, start_d, end_d)
 if df.empty:
     st.error("❌ 错误：无法获取任何数据。请检查网络。")
 else:
-    # 运行手动参数的回测
     with st.spinner("正在进行双轨回测..."):
         res_base = run_strategy_engine(df, st.session_state.my_assets, params, start_d, False, False)
         res_new = run_strategy_engine(df, st.session_state.my_assets, params, start_d, use_rsi, use_acc)
@@ -266,7 +276,6 @@ else:
         rb, mb, sb = calc_metrics(nav_base)
         rn, mn, sn = calc_metrics(nav_new)
 
-        # 顶部指标卡
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("累计收益 (优化后)", f"{rn:.2%}", delta=f"{rn-rb:.2%}")
         c2.metric("最大回撤", f"{mn:.2%}", delta=f"{mn-mb:.2%}", delta_color="inverse")
@@ -274,7 +283,6 @@ else:
         last_holdings = res_new['res']['holdings'].iloc[-1] if not res_new['res'].empty else []
         c4.metric("当前策略持仓", ", ".join(last_holdings) if last_holdings else "空仓")
 
-        # 核心三大模块展示区
         tab1, tab2, tab3 = st.tabs(["📈 净值曲线 (手动调参)", "🧬 详细持仓诊断", "🤖 自动寻优防过拟合"])
         
         with tab1:
@@ -340,22 +348,20 @@ else:
                     )
                     
         with tab3:
-            st.markdown("#### 🚀 参数高原扫描器 (Grid Search)")
-            st.info("💡 寻找夏普比率深绿色的聚集区（高原），避免选择周围全是红色的孤立高分（孤峰防过拟合）。")
+            st.markdown("#### 🚀 因子联合网格寻优 (Grid Search)")
+            st.info("💡 结合你在侧边栏设置的熔断阈值，测试不同长短周期下，开启/关闭因子的实际效果。")
             
             if st.button("▶️ 开始全量网格寻优 (约需10-30秒)"):
                 with st.spinner("正在暴力破解最佳参数组合..."):
-                    grid_results = run_grid_search(df, st.session_state.my_assets, start_d)
+                    grid_results = run_grid_search(df, st.session_state.my_assets, start_d, params)
                     
                 if not grid_results.empty:
-                    st.success("寻优完成！以下是基于历史数据的参数热力图：")
+                    st.success("寻优完成！以下是基于历史数据的参数组合排名：")
                     
-                    # 绘制热力风格表格
+                    # 绘制普通表格 (已移除 matplotlib 的渐变依赖，完美适配云端)
                     st.dataframe(
                         grid_results.style
-                        .format({"累计收益": "{:.2%}", "最大回撤": "{:.2%}", "夏普比率": "{:.2f}"})
-                        .background_gradient(subset=["夏普比率"], cmap="RdYlGn") # 红黄绿渐变
-                        .background_gradient(subset=["最大回撤"], cmap="RdYlGn_r"), # 绿黄红渐变（回撤越小越绿）
+                        .format({"累计收益": "{:.2%}", "最大回撤": "{:.2%}", "夏普比率": "{:.2f}"}),
                         use_container_width=True,
                         height=500
                     )
