@@ -34,14 +34,14 @@ if 'my_assets' not in st.session_state:
     st.session_state.my_assets = DEFAULT_ASSETS.copy()
 
 # 初始化实盘交易记录表 (基准起点: 2026-02-13)
+# 移除了 Cash_Flow 列，改为后台自动计算
 if 'trade_history' not in st.session_state:
     st.session_state.trade_history = pd.DataFrame({
         "Date": [datetime.date(2026, 2, 13)],
         "Action": ["买入"],
-        "Asset": ["日经ETF"], # 模糊匹配: 包含 "日经ETF" 即可识别
-        "Price": [1.00],      
-        "Volume": [943100.0],
-        "Cash_Flow": [-943100.0]
+        "Asset": ["日经ETF"], 
+        "Price": [1.000],      
+        "Volume": [943100.0]
     })
 
 # ================= 2. 双路热备数据获取逻辑 =================
@@ -183,9 +183,9 @@ def run_strategy_engine(df_all, assets, params, user_start_date, use_rsi_filter=
         "raw_ma": ma.loc[mask_slice], "raw_tradeable": is_tradeable.loc[mask_slice]
     }
 
-# ================= 3. 实盘净值计算引擎 (终极修复版) =================
+# ================= 3. 实盘净值计算引擎 (自动计算现金流版) =================
 def calculate_real_portfolio(df_prices, trade_history, start_date_str="2026-02-13", initial_nav=1.0):
-    """带模糊匹配和账户诊断的实盘计算核心"""
+    """带模糊匹配和账户诊断的实盘计算核心，自动计算现金变动"""
     if df_prices.empty or trade_history.empty:
         return None, None
         
@@ -199,6 +199,17 @@ def calculate_real_portfolio(df_prices, trade_history, start_date_str="2026-02-1
     
     trades = trade_history.copy()
     trades['Date'] = pd.to_datetime(trades['Date']).dt.date
+    
+    # === 核心改动：后台自动计算每一次交易产生的现金流 ===
+    def calc_cash_flow(row):
+        try:
+            val = float(row['Price']) * float(row['Volume'])
+            return -val if row['Action'] == "买入" else val
+        except:
+            return 0.0
+    trades['Cash_Flow'] = trades.apply(calc_cash_flow, axis=1)
+    # ===================================================
+    
     trades = trades.sort_values("Date")
     trade_idx = 0
     num_trades = len(trades)
@@ -295,9 +306,34 @@ else:
     # ---------------- 页面 1：实盘资金曲线与记账 ----------------
     with tab1:
         st.markdown("### 📝 手动实盘调仓记录表")
-        st.info("💡 初始基准日：2026年2月13日，起始净值约定为 1.0000。资产名称必须包含右侧下拉框中的关键词。负数 Cash_Flow 代表买入花钱，正数代表卖出收钱。")
+        st.info("💡 初始基准日：2026年2月13日，起始净值约定为 1.0000。输入单价和数量后，系统会自动在后台计算扣除/增加的账户现金。")
         
-        edited_df = st.data_editor(st.session_state.trade_history, num_rows="dynamic", use_container_width=True)
+        # 提取当前资产池里所有的 ETF 名称，作为下拉菜单的选项
+        asset_options = list(st.session_state.my_assets.values())
+        
+        # 使用 column_config 将手动输入升级为下拉选项
+        edited_df = st.data_editor(
+            st.session_state.trade_history, 
+            num_rows="dynamic", 
+            use_container_width=True,
+            column_config={
+                "Date": st.column_config.DateColumn("交易日 (Date)", required=True),
+                "Action": st.column_config.SelectboxColumn(
+                    "动作 (Action)",
+                    help="请选择买入或卖出",
+                    options=["买入", "卖出"],
+                    required=True,
+                ),
+                "Asset": st.column_config.SelectboxColumn(
+                    "标的 (Asset)",
+                    help="只能选择清单中存在的标的",
+                    options=asset_options,
+                    required=True,
+                ),
+                "Price": st.column_config.NumberColumn("成交单价 (Price)", format="%.3f", required=True),
+                "Volume": st.column_config.NumberColumn("成交份数 (Volume)", step=100, required=True),
+            }
+        )
         st.session_state.trade_history = edited_df
         
         if st.button("🔄 重新计算实盘净值曲线"):
@@ -306,7 +342,7 @@ else:
                 
             if real_nav_df is not None:
                 if final_state['cash'] == 0 and final_state['market_value'] == 0:
-                    st.error("⚠️ 诊断：系统计算你的账户现金和市值均为 0！请检查表格中的【Asset】一列，必须包含如 '日经ETF' 或 '纳指ETF' 的字眼。")
+                    st.error("⚠️ 诊断：系统计算你的账户现金和市值均为 0！这通常意味着你的第一笔交易未能成功识别，请确保表格第一行的标的和日期无误。")
                 else:
                     current_nav = real_nav_df['Real_NAV'].iloc[-1]
                     st.metric(label="当前实盘绝对净值", value=f"{current_nav:.4f}", delta=f"{(current_nav-1.0):.2%}")
@@ -400,7 +436,6 @@ else:
         if res_new is not None:
             nav_new = res_new['res']['nav']
             
-            # --- 找回丢失的计算核心指标函数 ---
             def calc_metrics(nav):
                 if len(nav) < 2: return 0, 0, 0 
                 ret = nav.iloc[-1] - 1
@@ -411,20 +446,14 @@ else:
                 
             rn, mn, sn = calc_metrics(nav_new)
             
-            # --- 渲染回测指标面板 ---
             st.markdown("### 📊 理论策略历史表现 (基于当前最新参数)")
             c1, c2, c3 = st.columns(3)
             c1.metric(label="理论累计收益", value=f"{rn:.2%}")
             c2.metric(label="区间最大回撤", value=f"{mn:.2%}")
             c3.metric(label="年化夏普比率", value=f"{sn:.2f}")
             
-            # --- 渲染回测曲线 ---
             fig_backtest = go.Figure()
             fig_backtest.add_trace(go.Scatter(x=nav_new.index, y=nav_new, name="理论净值", line=dict(color='#00ff88', width=2)))
-            
-            # 添加最大回撤的阴影提示 (视觉优化)
-            running_max = nav_new.cummax()
-            drawdown = (nav_new - running_max) / running_max
             
             fig_backtest.update_layout(
                 height=450, 
