@@ -261,6 +261,17 @@ st.title("🧪 动能工厂 - 实盘追踪版 🚀")
 
 df = get_clean_data(st.session_state.my_assets, start_d, end_d)
 
+# ====== 新增：数据健康度体检雷达 ======
+if not df.empty:
+    missing_assets = [name for name in st.session_state.my_assets.values() if name not in df.columns]
+    if missing_assets:
+        st.warning(f"⚠️ **网络拦截警告**：以下标的今日未能从云端成功抓取数据：{', '.join(missing_assets)}。这会导致相关的实盘净值呈现为水平直线。")
+    with st.expander("📊 查看底层数据健康度 (调试专用)"):
+        st.write("✅ 成功获取数据的标的：", list(df.columns))
+        st.dataframe(df.tail(3)) # 看看最近3天的真实数据到底长啥样
+# ======================================
+df = get_clean_data(st.session_state.my_assets, start_d, end_d)
+
 if df.empty:
     st.error("❌ 数据获取失败。请检查海外网络拦截或 API 限制。")
 else:
