@@ -359,5 +359,4 @@ else:
             fig_backtest.add_trace(go.Scatter(x=nav_new.index, y=nav_new, name="纯策略理论净值", line=dict(color='#00ff88', width=2)))
             fig_backtest.update_layout(height=400, template="plotly_dark", title="理论策略全历史回测曲线")
             st.plotly_chart(fig_backtest, use_container_width=True)
-``` 你可以随时让我修改或删除预设操作。预设操作准备就绪时，“近期对话”中的本次对话旁边会出现一个小圆点。
-http://googleusercontent.com/task_confirmation_content/2
+
