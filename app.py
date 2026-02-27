@@ -399,7 +399,38 @@ else:
     with tab3:
         if res_new is not None:
             nav_new = res_new['res']['nav']
+            
+            # --- 找回丢失的计算核心指标函数 ---
+            def calc_metrics(nav):
+                if len(nav) < 2: return 0, 0, 0 
+                ret = nav.iloc[-1] - 1
+                mdd = ((nav - nav.cummax()) / nav.cummax()).min()
+                dr = nav.pct_change().dropna()
+                shp = (dr.mean()*252)/(dr.std()*np.sqrt(252)) if dr.std()!=0 else 0
+                return ret, mdd, shp
+                
+            rn, mn, sn = calc_metrics(nav_new)
+            
+            # --- 渲染回测指标面板 ---
+            st.markdown("### 📊 理论策略历史表现 (基于当前最新参数)")
+            c1, c2, c3 = st.columns(3)
+            c1.metric(label="理论累计收益", value=f"{rn:.2%}")
+            c2.metric(label="区间最大回撤", value=f"{mn:.2%}")
+            c3.metric(label="年化夏普比率", value=f"{sn:.2f}")
+            
+            # --- 渲染回测曲线 ---
             fig_backtest = go.Figure()
-            fig_backtest.add_trace(go.Scatter(x=nav_new.index, y=nav_new, name="纯策略理论净值", line=dict(color='#00ff88', width=2)))
-            fig_backtest.update_layout(height=400, template="plotly_dark", title="理论策略全历史回测曲线")
+            fig_backtest.add_trace(go.Scatter(x=nav_new.index, y=nav_new, name="理论净值", line=dict(color='#00ff88', width=2)))
+            
+            # 添加最大回撤的阴影提示 (视觉优化)
+            running_max = nav_new.cummax()
+            drawdown = (nav_new - running_max) / running_max
+            
+            fig_backtest.update_layout(
+                height=450, 
+                template="plotly_dark", 
+                title="📈 纯策略全历史回测资金曲线 (不含现实滑点与手续费)",
+                yaxis_title="净值",
+                hovermode="x unified"
+            )
             st.plotly_chart(fig_backtest, use_container_width=True)
