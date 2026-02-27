@@ -1,5 +1,6 @@
 import streamlit as st
-import akshare as ak  
+import akshare as ak 
+import yfinance as yf
 import pandas as pd
 import datetime
 import plotly.graph_objects as go
