@@ -21,7 +21,7 @@ for key, val in DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
-# 恢复带有后缀的代码格式，以兼容 YFinance 的全球抓取兜底
+# 带有后缀的代码格式，以兼容 YFinance 兜底
 DEFAULT_ASSETS = {
     "513100.SS": "纳指ETF", "513520.SS": "日经ETF", "513180.SS": "恒生科技",
     "510180.SS": "上证180", "159915.SZ": "创业板指", "518880.SS": "黄金ETF",
@@ -38,8 +38,8 @@ if 'trade_history' not in st.session_state:
     st.session_state.trade_history = pd.DataFrame({
         "Date": [datetime.date(2026, 2, 13)],
         "Action": ["买入"],
-        "Asset": ["日经ETF"], # 这里的名字必须与 DEFAULT_ASSETS 的 value 一致
-        "Price": [1.00],      # 仅作记录，实际计算将按真实收盘价和基准折算
+        "Asset": ["日经ETF"], # 模糊匹配: 包含 "日经ETF" 即可识别
+        "Price": [1.00],      
         "Volume": [943100.0],
         "Cash_Flow": [-943100.0]
     })
@@ -58,7 +58,7 @@ def calculate_rsi_series(series, period=14):
 
 @st.cache_data(ttl=3600)
 def get_clean_data(assets_dict, start_date, end_date):
-    """双路热备：AKShare 优先，YFinance 兜底 (完美解决云端被墙)"""
+    """双路热备：AKShare 优先，YFinance 兜底"""
     targets = {**assets_dict, **BENCHMARKS}
     fetch_start = start_date - timedelta(days=365) 
     s_date_str = fetch_start.strftime("%Y%m%d")
@@ -74,19 +74,17 @@ def get_clean_data(assets_dict, start_date, end_date):
         progress_bar.progress((i + 1) / total)
         series_data = None
         
-        # 提取纯数字代码供 AKShare 使用
         code_num = ticker.split('.')[0] 
         
-        # [路线 1]: 尝试国内接口 (AKShare)
+        # [路线 1]: AKShare
         try:
             df_ak = ak.fund_etf_hist_em(symbol=code_num, period="daily", start_date=s_date_str, end_date=e_date_str, adjust="hfq")
             if not df_ak.empty:
                 df_ak['date'] = pd.to_datetime(df_ak['日期'])
                 series_data = df_ak.set_index('date')['收盘']
-        except: 
-            pass # 被墙或失败则静默跳过
+        except: pass
             
-        # [路线 2]: 如果路线 1 失败，立即触发 YFinance 兜底
+        # [路线 2]: YFinance 兜底
         if series_data is None or series_data.empty:
             try:
                 df_yf = yf.download(ticker, start=fetch_start, end=end_date + timedelta(days=1), progress=False)
@@ -98,14 +96,13 @@ def get_clean_data(assets_dict, start_date, end_date):
                         series_data = df_yf['Adj Close'] if 'Adj Close' in df_yf.columns else df_yf['Close']
                     if series_data.index.tz is not None:
                         series_data.index = series_data.index.tz_localize(None)
-            except: 
-                pass
+            except: pass
 
         if series_data is not None and not series_data.empty:
             series_data.name = name 
             combined_df = pd.merge(combined_df, series_data, left_index=True, right_index=True, how='outer')
             
-        time.sleep(0.1) # 保护接口
+        time.sleep(0.1) 
     
     progress_bar.empty()
     status_text.empty()
@@ -186,50 +183,73 @@ def run_strategy_engine(df_all, assets, params, user_start_date, use_rsi_filter=
         "raw_ma": ma.loc[mask_slice], "raw_tradeable": is_tradeable.loc[mask_slice]
     }
 
-# ================= 3. 实盘净值计算引擎 =================
+# ================= 3. 实盘净值计算引擎 (终极修复版) =================
 def calculate_real_portfolio(df_prices, trade_history, start_date_str="2026-02-13", initial_nav=1.0):
-    """根据手动交易记录，结合真实行情计算每日绝对净资产"""
+    """带模糊匹配和账户诊断的实盘计算核心"""
     if df_prices.empty or trade_history.empty:
-        return None
+        return None, None
         
     start_dt = pd.to_datetime(start_date_str)
     df_p = df_prices.loc[df_prices.index >= start_dt].copy()
-    if df_p.empty: return None
+    if df_p.empty: return None, None
 
     positions = {name: 0.0 for name in DEFAULT_ASSETS.values()}
     cash = 0.0
     daily_total_value = []
     
+    trades = trade_history.copy()
+    trades['Date'] = pd.to_datetime(trades['Date']).dt.date
+    trades = trades.sort_values("Date")
+    trade_idx = 0
+    num_trades = len(trades)
+    
     for current_date in df_p.index:
         current_date_date = current_date.date()
-        day_trades = trade_history[pd.to_datetime(trade_history['Date']).dt.date == current_date_date]
         
-        for _, trade in day_trades.iterrows():
-            asset_name = trade['Asset']
-            if trade['Action'] == "买入" and asset_name in positions:
-                positions[asset_name] += trade['Volume']
-                cash += trade['Cash_Flow']
-            elif trade['Action'] == "卖出" and asset_name in positions:
-                positions[asset_name] -= trade['Volume']
-                cash += trade['Cash_Flow']
+        # 鲁棒执行历史累积交易
+        while trade_idx < num_trades:
+            trade_date = trades.iloc[trade_idx]['Date']
+            if trade_date <= current_date_date:
+                trade = trades.iloc[trade_idx]
+                
+                # 模糊匹配资产名称
+                raw_asset_name = str(trade['Asset'])
+                matched_name = None
+                for name in positions.keys():
+                    if name in raw_asset_name:
+                        matched_name = name
+                        break
+                        
+                if matched_name:
+                    if trade['Action'] == "买入":
+                        positions[matched_name] += float(trade['Volume'])
+                        cash += float(trade['Cash_Flow'])
+                    elif trade['Action'] == "卖出":
+                        positions[matched_name] -= float(trade['Volume'])
+                        cash += float(trade['Cash_Flow'])
+                trade_idx += 1
+            else:
+                break
 
+        # 计算当日收盘总市值
         market_value = 0.0
         for asset, vol in positions.items():
             if vol > 0 and asset in df_p.columns:
-                market_value += vol * df_p.loc[current_date, asset]
+                market_value += vol * float(df_p.loc[current_date, asset])
                 
         total_assets = cash + market_value
         daily_total_value.append(total_assets)
         
     res_df = pd.DataFrame({"Total_Assets": daily_total_value}, index=df_p.index)
     
-    # 将第一天收盘时的总资产定义为初始基准净值 (1.00)
     initial_assets = res_df['Total_Assets'].iloc[0]
-    if initial_assets == 0: initial_assets = 1 # 防止除以0
-    res_df['Real_NAV'] = (res_df['Total_Assets'] / initial_assets) * initial_nav
-    
-    return res_df
-
+    if initial_assets == 0: 
+        res_df['Real_NAV'] = 0.0 
+    else:
+        res_df['Real_NAV'] = (res_df['Total_Assets'] / initial_assets) * initial_nav
+        
+    final_state = {"cash": cash, "market_value": market_value, "positions": positions}
+    return res_df, final_state
 
 # ================= 4. UI 侧边栏 =================
 with st.sidebar:
@@ -261,16 +281,11 @@ st.title("🧪 动能工厂 - 实盘追踪版 🚀")
 
 df = get_clean_data(st.session_state.my_assets, start_d, end_d)
 
-# ====== 新增：数据健康度体检雷达 ======
+# 增加数据诊断雷达
 if not df.empty:
     missing_assets = [name for name in st.session_state.my_assets.values() if name not in df.columns]
     if missing_assets:
-        st.warning(f"⚠️ **网络拦截警告**：以下标的今日未能从云端成功抓取数据：{', '.join(missing_assets)}。这会导致相关的实盘净值呈现为水平直线。")
-    with st.expander("📊 查看底层数据健康度 (调试专用)"):
-        st.write("✅ 成功获取数据的标的：", list(df.columns))
-        st.dataframe(df.tail(3)) # 看看最近3天的真实数据到底长啥样
-# ======================================
-df = get_clean_data(st.session_state.my_assets, start_d, end_d)
+        st.warning(f"⚠️ **网络拦截警告**：以下标的未能抓取数据：{', '.join(missing_assets)}。这将导致实盘计算误差。")
 
 if df.empty:
     st.error("❌ 数据获取失败。请检查海外网络拦截或 API 限制。")
@@ -280,35 +295,40 @@ else:
     # ---------------- 页面 1：实盘资金曲线与记账 ----------------
     with tab1:
         st.markdown("### 📝 手动实盘调仓记录表")
-        st.info("💡 初始基准日：2026年2月13日，起始净值约定为 1.0000。资产名称必须与右侧下拉框一致。负数 Cash_Flow 代表买入花钱，正数代表卖出收钱。")
+        st.info("💡 初始基准日：2026年2月13日，起始净值约定为 1.0000。资产名称必须包含右侧下拉框中的关键词。负数 Cash_Flow 代表买入花钱，正数代表卖出收钱。")
         
-        # 记录表单展示 (支持交互式增删改)
         edited_df = st.data_editor(st.session_state.trade_history, num_rows="dynamic", use_container_width=True)
         st.session_state.trade_history = edited_df
         
         if st.button("🔄 重新计算实盘净值曲线"):
             with st.spinner("正在根据真实行情合并计算..."):
-                real_nav_df = calculate_real_portfolio(df, st.session_state.trade_history)
+                real_nav_df, final_state = calculate_real_portfolio(df, st.session_state.trade_history)
                 
             if real_nav_df is not None:
-                current_nav = real_nav_df['Real_NAV'].iloc[-1]
-                st.metric(label="当前实盘绝对净值", value=f"{current_nav:.4f}", delta=f"{(current_nav-1.0):.2%}")
-                
-                # 绘制实盘资金曲线
-                fig_real = go.Figure()
-                fig_real.add_trace(go.Scatter(x=real_nav_df.index, y=real_nav_df['Real_NAV'], name="实盘净值", line=dict(color='#ff00ff', width=3)))
-                
-                # 添加调仓标记点
-                trade_dates = pd.to_datetime(st.session_state.trade_history['Date']).dt.date
-                for dt in trade_dates:
-                    try:
-                        valid_dt = real_nav_df.index[real_nav_df.index.date >= dt][0]
-                        nav_val = real_nav_df.loc[valid_dt, 'Real_NAV']
-                        fig_real.add_annotation(x=valid_dt, y=nav_val, text="🔄 调仓", showarrow=True, arrowhead=1, ax=0, ay=-40)
-                    except: pass
+                if final_state['cash'] == 0 and final_state['market_value'] == 0:
+                    st.error("⚠️ 诊断：系统计算你的账户现金和市值均为 0！请检查表格中的【Asset】一列，必须包含如 '日经ETF' 或 '纳指ETF' 的字眼。")
+                else:
+                    current_nav = real_nav_df['Real_NAV'].iloc[-1]
+                    st.metric(label="当前实盘绝对净值", value=f"{current_nav:.4f}", delta=f"{(current_nav-1.0):.2%}")
                     
-                fig_real.update_layout(height=400, template="plotly_dark", title="📈 账户绝对净值走势 (基准 1.00)")
-                st.plotly_chart(fig_real, use_container_width=True)
+                    c_a, c_b, c_c = st.columns(3)
+                    c_a.metric("账户现金余额", f"¥ {final_state['cash']:,.2f}")
+                    c_b.metric("当前持仓市值", f"¥ {final_state['market_value']:,.2f}")
+                    c_c.metric("当前总资产", f"¥ {(final_state['cash'] + final_state['market_value']):,.2f}")
+                    
+                    fig_real = go.Figure()
+                    fig_real.add_trace(go.Scatter(x=real_nav_df.index, y=real_nav_df['Real_NAV'], name="实盘净值", line=dict(color='#ff00ff', width=3)))
+                    
+                    trade_dates = pd.to_datetime(st.session_state.trade_history['Date']).dt.date
+                    for dt in trade_dates:
+                        try:
+                            valid_dt = real_nav_df.index[real_nav_df.index.date >= dt][0]
+                            nav_val = real_nav_df.loc[valid_dt, 'Real_NAV']
+                            fig_real.add_annotation(x=valid_dt, y=nav_val, text="🔄 调仓", showarrow=True, arrowhead=1, ax=0, ay=-40)
+                        except: pass
+                        
+                    fig_real.update_layout(height=400, template="plotly_dark", title="📈 账户绝对净值走势 (基准 1.00)")
+                    st.plotly_chart(fig_real, use_container_width=True)
             else:
                 st.warning("行情数据尚不足以覆盖交易记录的日期区间。")
 
