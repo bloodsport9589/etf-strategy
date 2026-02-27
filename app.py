@@ -1,5 +1,4 @@
 import streamlit as st
-import yfinance as yf
 import akshare as ak  
 import pandas as pd
 import datetime
@@ -7,30 +6,44 @@ import plotly.graph_objects as go
 import numpy as np
 import itertools
 from datetime import timedelta
+import time
 
-# ================= 1. 基础配置 =================
-st.set_page_config(page_title="全球动能工厂-混合数据版", page_icon="🏭", layout="wide")
+# ================= 1. 基础配置 & 新默认参数 =================
+st.set_page_config(page_title="全球动能工厂-实盘追踪版", page_icon="🏭", layout="wide")
 
+# 【已修改】应用你的最新参数作为默认值
 DEFAULTS = {
-    "rs": 20, "rl": 60, "rw": 100, "h": 1, "m": 20,
-    "rsi_period": 14, "rsi_limit": 80, "acc_limit": -0.05 
+    "rs": 15, "rl": 61, "rw": 100, "h": 1, "m": 95,
+    "rsi_period": 14, "rsi_limit": 91, "acc_limit": -0.15 
 }
 for key, val in DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
+# 【已修改】所有资产均统一为6位数字代码，方便纯 AKShare 抓取
 DEFAULT_ASSETS = {
-    "513100.SS": "纳指ETF", "513520.SS": "日经ETF", "513180.SS": "恒生科技",
-    "510180.SS": "上证180", "159915.SZ": "创业板指", "518880.SS": "黄金ETF",
-    "512400.SS": "有色ETF", "159981.SZ": "豆粕ETF", "588050.SS": "科创50",
-    "USO": "原油", 
+    "513100": "纳指ETF", "513520": "日经ETF", "513180": "恒生科技",
+    "510180": "上证180", "159915": "创业板指", "518880": "黄金ETF",
+    "512400": "有色ETF", "159981": "豆粕ETF", "588050": "科创50",
+    "501018": "南方原油", 
 }
-BENCHMARKS = {"510300.SS": "沪深300", "^GSPC": "标普500"}
+BENCHMARKS = {"510300": "沪深300"}
 
 if 'my_assets' not in st.session_state:
     st.session_state.my_assets = DEFAULT_ASSETS.copy()
 
-# ================= 2. 核心计算逻辑 =================
+# 初始化实盘交易记录表
+if 'trade_history' not in st.session_state:
+    st.session_state.trade_history = pd.DataFrame({
+        "Date": [datetime.date(2026, 2, 13)],
+        "Action": ["买入"],
+        "Asset": ["513520 (日经ETF)"],
+        "Price": [1.00], # 假设初始买入价，后续计算按比例折算
+        "Volume": [943100.0],
+        "Cash_Flow": [-943100.0]
+    })
+
+# ================= 2. 彻底修复的数据获取逻辑 =================
 
 def calculate_rsi_series(series, period=14):
     delta = series.diff()
@@ -44,7 +57,7 @@ def calculate_rsi_series(series, period=14):
 
 @st.cache_data(ttl=3600)
 def get_clean_data(assets_dict, start_date, end_date):
-    """带A股主日历对齐的数据获取"""
+    """纯 AKShare 抓取逻辑，完美适配南方原油等所有场内标的"""
     targets = {**assets_dict, **BENCHMARKS}
     fetch_start = start_date - timedelta(days=365) 
     s_date_str = fetch_start.strftime("%Y%m%d")
@@ -55,43 +68,29 @@ def get_clean_data(assets_dict, start_date, end_date):
     status_text = st.empty()
     total = len(targets)
     
-    for i, (ticker, name) in enumerate(targets.items()):
-        status_text.text(f"正在获取 ({i+1}/{total}): {name}...")
+    for i, (code, name) in enumerate(targets.items()):
+        status_text.text(f"正在抓取 ({i+1}/{total}): {name} ({code})...")
         progress_bar.progress((i + 1) / total)
-        series_data = None
         
-        if ticker[0].isdigit(): 
-            try:
-                code = ticker.split('.')[0]
-                df_ak = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=s_date_str, end_date=e_date_str, adjust="hfq")
-                if not df_ak.empty:
-                    df_ak['date'] = pd.to_datetime(df_ak['日期'])
-                    df_ak.set_index('date', inplace=True)
-                    series_data = df_ak['收盘']
-            except: pass 
-
-        if series_data is None or series_data.empty:
-            try:
-                df_yf = yf.download(ticker, start=fetch_start, end=end_date + timedelta(days=1), progress=False)
-                if not df_yf.empty:
-                    if isinstance(df_yf.columns, pd.MultiIndex):
-                        try: series_data = df_yf[('Adj Close', ticker)]
-                        except: series_data = df_yf.iloc[:, 0] 
-                    else:
-                        series_data = df_yf['Adj Close'] if 'Adj Close' in df_yf.columns else df_yf['Close']
-                    if series_data.index.tz is not None:
-                        series_data.index = series_data.index.tz_localize(None)
-            except: pass
-
-        if series_data is not None and not series_data.empty:
-            series_data.name = name 
-            combined_df = pd.merge(combined_df, series_data, left_index=True, right_index=True, how='outer')
+        try:
+            # 统一使用东方财富历史数据接口
+            df_ak = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=s_date_str, end_date=e_date_str, adjust="hfq")
+            if not df_ak.empty:
+                df_ak['date'] = pd.to_datetime(df_ak['日期'])
+                df_ak.set_index('date', inplace=True)
+                series_data = df_ak['收盘']
+                series_data.name = name
+                combined_df = pd.merge(combined_df, series_data, left_index=True, right_index=True, how='outer')
+        except Exception as e:
+            pass
+            
+        time.sleep(0.2) # 防止请求过快被封
     
     progress_bar.empty()
     status_text.empty()
     if combined_df.empty: return pd.DataFrame()
 
-    hs300_name = BENCHMARKS.get("510300.SS", "沪深300")
+    hs300_name = BENCHMARKS.get("510300", "沪深300")
     if hs300_name in combined_df.columns:
         valid_a_share_dates = combined_df[hs300_name].dropna().index
         combined_df = combined_df.loc[valid_a_share_dates]
@@ -100,7 +99,7 @@ def get_clean_data(assets_dict, start_date, end_date):
     return combined_df
 
 def run_strategy_engine(df_all, assets, params, user_start_date, use_rsi_filter=False, use_acc_filter=False):
-    """带停牌微观过滤的策略引擎"""
+    """核心策略回测引擎保持不变"""
     rs, rl, rw = params['rs'], params['rl'], params['rw']
     h, m = params['h'], params['m']
     rsi_p, rsi_limit = params['rsi_period'], params['rsi_limit']
@@ -128,8 +127,6 @@ def run_strategy_engine(df_all, assets, params, user_start_date, use_rsi_filter=
     s_vals, p_vals, m_vals = scores.values, df_t.values, ma.values
     r_vals, rsi_vals, acc_vals = rets.values, rsi_df.values, acc_df.values
     t_vals = is_tradeable.values
-    
-    filter_stats = {"rsi_triggered": 0, "acc_triggered": 0}
 
     for i in range(warm_up, len(df_t) - 1):
         valid_data = np.isfinite(s_vals[i]) & np.isfinite(p_vals[i]) & np.isfinite(m_vals[i])
@@ -168,81 +165,76 @@ def run_strategy_engine(df_all, assets, params, user_start_date, use_rsi_filter=
         "raw_ma": ma.loc[mask_slice], "raw_tradeable": is_tradeable.loc[mask_slice]
     }
 
-# ================= 3. 自动网格寻优引擎 =================
-def run_grid_search(df_all, assets_dict, start_d, base_params):
-    """遍历寻找夏普比率高原，引入熔断因子的开关测试"""
-    rs_list = [15, 20, 25]  
-    rl_list = [60, 120]
-    
-    # 引入熔断开关的遍历 (开启 vs 不开启)
-    use_rsi_list = [False, True]
-    use_acc_list = [False, True]
-    
-    results = []
-    # 4 个维度的全排列组合
-    combinations = list(itertools.product(rs_list, rl_list, use_rsi_list, use_acc_list))
-    
-    progress = st.progress(0)
-    status = st.empty()
-    
-    for i, (test_rs, test_rl, test_use_rsi, test_use_acc) in enumerate(combinations):
-        status.text(f"正在回测 ({i+1}/{len(combinations)}): 短期={test_rs}, 长期={test_rl}, RSI熔断={test_use_rsi}, 加速度过滤={test_use_acc}")
+# ================= 3. 实盘净值计算引擎 =================
+def calculate_real_portfolio(df_prices, trade_history, start_date_str="2026-02-13", initial_nav=1.0):
+    """根据手动交易记录，结合真实行情计算每日净资产和基准净值"""
+    if df_prices.empty or trade_history.empty:
+        return None
         
-        test_params = base_params.copy()
-        test_params.update({"rs": test_rs, "rl": test_rl})
+    start_dt = pd.to_datetime(start_date_str)
+    # 截取起始日之后的真实行情
+    df_p = df_prices.loc[df_prices.index >= start_dt].copy()
+    if df_p.empty: return None
+
+    # 初始化持仓和现金
+    positions = {name: 0.0 for name in DEFAULT_ASSETS.values()}
+    cash = 0.0
+    
+    daily_total_value = []
+    
+    for current_date in df_p.index:
+        current_date_date = current_date.date()
         
-        res = run_strategy_engine(
-            df_all, assets_dict, test_params, start_d, 
-            use_rsi_filter=test_use_rsi, use_acc_filter=test_use_acc
-        )
-        
-        if res is not None:
-            nav = res['res']['nav']
-            if len(nav) > 2:
-                dr = nav.pct_change().dropna()
-                ret = nav.iloc[-1] - 1
-                mdd = ((nav - nav.cummax()) / nav.cummax()).min()
-                shp = (dr.mean()*252)/(dr.std()*np.sqrt(252)) if dr.std()!=0 else 0
+        # 处理当天的交易
+        day_trades = trade_history[pd.to_datetime(trade_history['Date']).dt.date == current_date_date]
+        for _, trade in day_trades.iterrows():
+            asset_name = trade['Asset'].split(" ")[-1].strip("()")
+            if trade['Action'] == "买入":
+                positions[asset_name] += trade['Volume']
+                cash += trade['Cash_Flow']
+            elif trade['Action'] == "卖出":
+                positions[asset_name] -= trade['Volume']
+                cash += trade['Cash_Flow']
+
+        # 计算当日收盘总市值
+        market_value = 0.0
+        for asset, vol in positions.items():
+            if vol > 0 and asset in df_p.columns:
+                market_value += vol * df_p.loc[current_date, asset]
                 
-                results.append({
-                    "短期(rs)": test_rs, 
-                    "长期(rl)": test_rl, 
-                    "RSI熔断": "✅" if test_use_rsi else "❌",
-                    "加速衰竭过滤": "✅" if test_use_acc else "❌",
-                    "累计收益": ret, 
-                    "最大回撤": mdd, 
-                    "夏普比率": shp
-                })
-        progress.progress((i + 1) / len(combinations))
+        total_assets = cash + market_value
+        daily_total_value.append(total_assets)
         
-    progress.empty()
-    status.empty()
+    res_df = pd.DataFrame({
+        "Total_Assets": daily_total_value
+    }, index=df_p.index)
     
-    if results:
-        df_res = pd.DataFrame(results).sort_values("夏普比率", ascending=False)
-        return df_res
-    return pd.DataFrame()
+    # 将第一天的总资产折算为起始净值 1.00
+    initial_assets = res_df['Total_Assets'].iloc[0]
+    res_df['Real_NAV'] = (res_df['Total_Assets'] / initial_assets) * initial_nav
+    
+    return res_df
+
 
 # ================= 4. UI 侧边栏 =================
 with st.sidebar:
-    st.header("🎛️ 手动实验参数设置")
-    with st.expander("1. 基础动量参数", expanded=True):
-        rs = st.slider("短期周期 (Fast)", 5, 60, 20)
-        rl = st.slider("长期周期 (Slow)", 30, 250, 60)
-        rw = st.slider("短期权重", 0, 100, 100) / 100.0
-        h = st.number_input("持仓数", 1, 10, 1)
-        m = st.number_input("风控均线 (MA)", 5, 120, 20)
+    st.header("🎛️ 策略参数微调")
+    with st.expander("当前使用新默认参数", expanded=True):
+        rs = st.slider("短期周期 (Fast)", 5, 60, st.session_state['rs'])
+        rl = st.slider("长期周期 (Slow)", 30, 250, st.session_state['rl'])
+        rw = st.slider("短期权重", 0, 100, st.session_state['rw']) / 100.0
+        h = st.number_input("持仓数", 1, 10, st.session_state['h'])
+        m = st.number_input("风控均线 (MA)", 5, 120, st.session_state['m'])
 
-    st.markdown("### 2. 新因子调节")
-    use_rsi = st.checkbox("启用 RSI 熔断", value=False)
-    rsi_limit = st.slider("RSI 上限", 50, 95, 80)
-    use_acc = st.checkbox("启用 加速度 过滤", value=False)
-    acc_limit = st.slider("加速度 下限", -0.2, 0.1, -0.05, 0.01)
+    use_rsi = st.checkbox("启用 RSI 熔断", value=True)
+    rsi_limit = st.slider("RSI 上限", 50, 95, st.session_state['rsi_limit'])
+    use_acc = st.checkbox("启用 加速度 过滤", value=True)
+    acc_limit = st.slider("加速度 下限", -0.2, 0.1, st.session_state['acc_limit'], 0.01)
 
     st.divider()
     col_d1, col_d2 = st.columns(2)
-    start_d = col_d1.date_input("开始", datetime.date.today() - datetime.timedelta(days=365*3))
-    end_d = col_d2.date_input("结束", datetime.date.today())
+    start_d = col_d1.date_input("回测开始", datetime.date.today() - datetime.timedelta(days=365*2))
+    end_d = col_d2.date_input("回测结束", datetime.date.today())
 
 params = {
     "rs": rs, "rl": rl, "rw": rw, "h": h, "m": m,
@@ -250,120 +242,122 @@ params = {
 }
 
 # ================= 5. 主界面 =================
-st.title("🧪 动能工厂 - 全能容错版实验室")
+st.title("🧪 动能工厂 - 实盘追踪版 🚀")
 
 df = get_clean_data(st.session_state.my_assets, start_d, end_d)
 
 if df.empty:
-    st.error("❌ 错误：无法获取任何数据。请检查网络。")
+    st.error("❌ 数据获取失败。请检查网络。")
 else:
-    with st.spinner("正在进行双轨回测..."):
-        res_base = run_strategy_engine(df, st.session_state.my_assets, params, start_d, False, False)
-        res_new = run_strategy_engine(df, st.session_state.my_assets, params, start_d, use_rsi, use_acc)
-
-    if res_base is not None and res_new is not None:
-        nav_base = res_base['res']['nav']
-        nav_new = res_new['res']['nav']
+    tab1, tab2, tab3 = st.tabs(["💰 个人实盘资金曲线", "📈 策略每日诊断播报", "⚙️ 历史全回测曲线"])
+    
+    # ---------------- 页面 1：实盘资金曲线与记账 ----------------
+    with tab1:
+        st.markdown("### 📝 手动实盘调仓记录表")
+        st.info("💡 初始基准日：2026年2月13日，起始净值约定为 1.0000。请在这里录入你真实的买卖操作。")
         
-        def calc_metrics(nav):
-            if len(nav) < 2: return 0, 0, 0 
-            ret = nav.iloc[-1] - 1
-            mdd = ((nav - nav.cummax()) / nav.cummax()).min()
-            dr = nav.pct_change().dropna()
-            shp = (dr.mean()*252)/(dr.std()*np.sqrt(252)) if dr.std()!=0 else 0
-            return ret, mdd, shp
-
-        rb, mb, sb = calc_metrics(nav_base)
-        rn, mn, sn = calc_metrics(nav_new)
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("累计收益 (优化后)", f"{rn:.2%}", delta=f"{rn-rb:.2%}")
-        c2.metric("最大回撤", f"{mn:.2%}", delta=f"{mn-mb:.2%}", delta_color="inverse")
-        c3.metric("夏普比率", f"{sn:.2f}", delta=f"{sn-sb:.2f}")
-        last_holdings = res_new['res']['holdings'].iloc[-1] if not res_new['res'].empty else []
-        c4.metric("当前策略持仓", ", ".join(last_holdings) if last_holdings else "空仓")
-
-        tab1, tab2, tab3 = st.tabs(["📈 净值曲线 (手动调参)", "🧬 详细持仓诊断", "🤖 自动寻优防过拟合"])
+        # 记录表单展示
+        edited_df = st.data_editor(st.session_state.trade_history, num_rows="dynamic", use_container_width=True)
+        st.session_state.trade_history = edited_df
         
-        with tab1:
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=nav_base.index, y=nav_base, name="原始策略", line=dict(color='gray', dash='dot')))
-            fig.add_trace(go.Scatter(x=nav_new.index, y=nav_new, name="当前策略", line=dict(color='#00ff88', width=3)))
-            fig.update_layout(height=500, template="plotly_dark", title="手动参数 A/B 测试对比")
-            st.plotly_chart(fig, use_container_width=True)
-
-        with tab2:
-            st.markdown("#### 🔎 截止回测结束日的持仓快照")
-            if not res_new['raw_scores'].empty:
-                last_idx = -1
-                r_score = res_new['raw_scores'].iloc[last_idx]
-                r_price = res_new['raw_prices'].iloc[last_idx]
-                r_ma = res_new['raw_ma'].iloc[last_idx]
-                r_rsi = res_new['raw_rsi'].iloc[last_idx]
-                r_acc = res_new['raw_acc'].iloc[last_idx]
-                r_trad = res_new['raw_tradeable'].iloc[last_idx]
+        if st.button("🔄 重新计算实盘净值曲线"):
+            with st.spinner("正在根据真实行情合并计算..."):
+                real_nav_df = calculate_real_portfolio(df, st.session_state.trade_history)
                 
-                real_holdings = res_new['res']['holdings'].iloc[last_idx]
+            if real_nav_df is not None:
+                current_nav = real_nav_df['Real_NAV'].iloc[-1]
+                st.metric(label="当前实盘绝对净值", value=f"{current_nav:.4f}", delta=f"{(current_nav-1.0):.2%}")
                 
-                snapshot = []
-                for name in r_score.index:
-                    if name not in r_price.index or pd.isna(r_score[name]): continue
-                    
-                    is_above_ma = r_price[name] > r_ma[name]
-                    is_pos_score = r_score[name] > 0
-                    rsi_ok = r_rsi[name] < rsi_limit
-                    acc_ok = r_acc[name] > acc_limit
-                    
-                    if not r_trad[name]:
-                        status, reason, color_code = "🚫 停牌熔断", "监测到价格无波动，判定停牌或未交易", -2
-                    elif name in real_holdings:
-                        status, reason, color_code = "✅ 实际持仓", "综合排名第一且满足所有条件", 1 
-                    else:
-                        if not is_pos_score: status, reason, color_code = "⚪ 落选", "动能评分为负", 0
-                        elif not is_above_ma: status, reason, color_code = "⚪ 落选", "价格跌破均线", 0
-                        elif use_rsi and not rsi_ok: status, reason, color_code = "⛔ 指标剔除", f"RSI({r_rsi[name]:.1f}) 超标", -1 
-                        elif use_acc and not acc_ok: status, reason, color_code = "⛔ 指标剔除", f"加速度({r_acc[name]:.1%}) 衰竭", -1
-                        else:
-                            status, reason, color_code = "⚠️ 备选", "符合条件，但分数不是最高", 2 
-                            if (not use_rsi and not rsi_ok) or (not use_acc and not acc_ok):
-                                reason += " (指标已报警但未开启过滤)"
-
-                    snapshot.append({
-                        "标的": name, "动能评分": r_score[name], "加速度": r_acc[name],
-                        "RSI": r_rsi[name], "🏛️ 实际持仓": status, "📋 判定原因": reason
-                    })
+                # 绘制带买卖点标记的实盘资金曲线
+                fig_real = go.Figure()
+                fig_real.add_trace(go.Scatter(x=real_nav_df.index, y=real_nav_df['Real_NAV'], name="实盘净值", line=dict(color='#ff00ff', width=3)))
                 
-                if snapshot:
-                    df_snap = pd.DataFrame(snapshot).sort_values("动能评分", ascending=False)
-                    def color_row(val):
-                        if "持仓" in val: return 'color: #00ff88; font-weight: bold; background-color: rgba(0,255,136,0.1)'
-                        if "指标剔除" in val: return 'color: #ff4444; font-weight: bold'
-                        if "停牌" in val: return 'color: #ffaa00; font-weight: bold; background-color: rgba(255,170,0,0.1)'
-                        if "备选" in val: return 'color: #ffcc00'
-                        return 'color: gray'
-
-                    st.dataframe(
-                        df_snap.style.format({"动能评分": "{:.2%}", "加速度": "{:.2%}", "RSI": "{:.1f}"})
-                        .map(color_row, subset=['🏛️ 实际持仓']), use_container_width=True, height=600
-                    )
+                # 添加调仓标记点
+                trade_dates = pd.to_datetime(st.session_state.trade_history['Date']).dt.date
+                for dt in trade_dates:
+                    try:
+                        # 找到最近的交易日
+                        valid_dt = real_nav_df.index[real_nav_df.index.date >= dt][0]
+                        nav_val = real_nav_df.loc[valid_dt, 'Real_NAV']
+                        fig_real.add_annotation(x=valid_dt, y=nav_val, text="🔄 调仓", showarrow=True, arrowhead=1)
+                    except: pass
                     
-        with tab3:
-            st.markdown("#### 🚀 因子联合网格寻优 (Grid Search)")
-            st.info("💡 结合你在侧边栏设置的熔断阈值，测试不同长短周期下，开启/关闭因子的实际效果。")
+                fig_real.update_layout(height=400, template="plotly_dark", title="📈 账户绝对净值走势 (基准 1.00)")
+                st.plotly_chart(fig_real, use_container_width=True)
+            else:
+                st.warning("行情数据尚不足以覆盖交易记录的日期区间。")
+
+    # ---------------- 页面 2：策略每日诊断 (每日必看) ----------------
+    with tab2:
+        with st.spinner("正在诊断最新一期交易信号..."):
+            res_new = run_strategy_engine(df, st.session_state.my_assets, params, start_d, use_rsi, use_acc)
             
-            if st.button("▶️ 开始全量网格寻优 (约需10-30秒)"):
-                with st.spinner("正在暴力破解最佳参数组合..."):
-                    grid_results = run_grid_search(df, st.session_state.my_assets, start_d, params)
-                    
-                if not grid_results.empty:
-                    st.success("寻优完成！以下是基于历史数据的参数组合排名：")
-                    
-                    # 绘制普通表格 (已移除 matplotlib 的渐变依赖，完美适配云端)
-                    st.dataframe(
-                        grid_results.style
-                        .format({"累计收益": "{:.2%}", "最大回撤": "{:.2%}", "夏普比率": "{:.2f}"}),
-                        use_container_width=True,
-                        height=500
-                    )
+        if res_new is not None and not res_new['raw_scores'].empty:
+            last_date = res_new['raw_scores'].index[-1]
+            st.markdown(f"### 🔎 {last_date.strftime('%Y-%m-%d')} 收盘后信号诊断结果")
+            
+            last_idx = -1
+            r_score = res_new['raw_scores'].iloc[last_idx]
+            r_price = res_new['raw_prices'].iloc[last_idx]
+            r_ma = res_new['raw_ma'].iloc[last_idx]
+            r_rsi = res_new['raw_rsi'].iloc[last_idx]
+            r_acc = res_new['raw_acc'].iloc[last_idx]
+            r_trad = res_new['raw_tradeable'].iloc[last_idx]
+            
+            real_holdings = res_new['res']['holdings'].iloc[last_idx]
+            
+            snapshot = []
+            for name in r_score.index:
+                if name not in r_price.index or pd.isna(r_score[name]): continue
+                
+                is_above_ma = r_price[name] > r_ma[name]
+                is_pos_score = r_score[name] > 0
+                rsi_ok = r_rsi[name] < rsi_limit
+                acc_ok = r_acc[name] > acc_limit
+                
+                if not r_trad[name]:
+                    status, reason = "🚫 停牌熔断", "无价格波动"
+                elif name in real_holdings:
+                    status, reason = "✅ 建议持仓", "综合排名第一且满足所有条件"
                 else:
-                    st.warning("网格寻优未能生成有效结果，请检查数据长度。")
+                    if not is_pos_score: status, reason = "⚪ 落选", "动能评分为负"
+                    elif not is_above_ma: status, reason = "⚪ 落选", "价格跌破均线"
+                    elif use_rsi and not rsi_ok: status, reason = "⛔ 熔断", f"RSI({r_rsi[name]:.1f}) 超标"
+                    elif use_acc and not acc_ok: status, reason = "⛔ 衰竭", f"加速度({r_acc[name]:.1%}) 剔除"
+                    else:
+                        status, reason = "⚠️ 备选排队", "各项健康，但在比拼中落败"
+
+                snapshot.append({
+                    "标的": name, "短动能(15日)": r_score[name], "加速度": r_acc[name],
+                    "RSI": r_rsi[name], "状态": status, "诊断原因": reason
+                })
+            
+            if snapshot:
+                df_snap = pd.DataFrame(snapshot).sort_values("短动能(15日)", ascending=False)
+                def color_row(val):
+                    if "持仓" in val: return 'color: #00ff88; font-weight: bold; background-color: rgba(0,255,136,0.1)'
+                    if "熔断" in val or "衰竭" in val: return 'color: #ff4444; font-weight: bold'
+                    if "备选" in val: return 'color: #ffcc00'
+                    return 'color: gray'
+
+                st.dataframe(
+                    df_snap.style.format({"短动能(15日)": "{:.2%}", "加速度": "{:.2%}", "RSI": "{:.1f}"})
+                    .map(color_row, subset=['状态']), use_container_width=True, height=400
+                )
+                
+                # 直观的大标题提示
+                if real_holdings:
+                    st.success(f"🎯 **策略明示：当前应当重点持仓 👉 {', '.join(real_holdings)}**")
+                else:
+                    st.warning("🛑 **策略明示：当前无任何资产通过安全检查，应当保持 👉 空仓 (现金)**")
+
+    # ---------------- 页面 3：历史回测基准 ----------------
+    with tab3:
+        if res_new is not None:
+            nav_new = res_new['res']['nav']
+            fig_backtest = go.Figure()
+            fig_backtest.add_trace(go.Scatter(x=nav_new.index, y=nav_new, name="纯策略理论净值", line=dict(color='#00ff88', width=2)))
+            fig_backtest.update_layout(height=400, template="plotly_dark", title="理论策略全历史回测曲线")
+            st.plotly_chart(fig_backtest, use_container_width=True)
+``` 你可以随时让我修改或删除预设操作。预设操作准备就绪时，“近期对话”中的本次对话旁边会出现一个小圆点。
+http://googleusercontent.com/task_confirmation_content/2
