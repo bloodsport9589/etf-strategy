@@ -1,6 +1,6 @@
 import streamlit as st
-import akshare as ak 
 import yfinance as yf
+import akshare as ak  
 import pandas as pd
 import datetime
 import plotly.graph_objects as go
@@ -12,7 +12,7 @@ import time
 # ================= 1. 基础配置 & 新默认参数 =================
 st.set_page_config(page_title="全球动能工厂-实盘追踪版", page_icon="🏭", layout="wide")
 
-# 【已修改】应用你的最新参数作为默认值
+# 应用最新参数作为默认值
 DEFAULTS = {
     "rs": 15, "rl": 61, "rw": 100, "h": 1, "m": 95,
     "rsi_period": 14, "rsi_limit": 91, "acc_limit": -0.15 
@@ -21,30 +21,30 @@ for key, val in DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
-# 【已修改】所有资产均统一为6位数字代码，方便纯 AKShare 抓取
+# 恢复带有后缀的代码格式，以兼容 YFinance 的全球抓取兜底
 DEFAULT_ASSETS = {
-    "513100": "纳指ETF", "513520": "日经ETF", "513180": "恒生科技",
-    "510180": "上证180", "159915": "创业板指", "518880": "黄金ETF",
-    "512400": "有色ETF", "159981": "豆粕ETF", "588050": "科创50",
-    "501018": "南方原油", 
+    "513100.SS": "纳指ETF", "513520.SS": "日经ETF", "513180.SS": "恒生科技",
+    "510180.SS": "上证180", "159915.SZ": "创业板指", "518880.SS": "黄金ETF",
+    "512400.SS": "有色ETF", "159981.SZ": "豆粕ETF", "588050.SS": "科创50",
+    "501018.SS": "南方原油", 
 }
-BENCHMARKS = {"510300": "沪深300"}
+BENCHMARKS = {"510300.SS": "沪深300"}
 
 if 'my_assets' not in st.session_state:
     st.session_state.my_assets = DEFAULT_ASSETS.copy()
 
-# 初始化实盘交易记录表
+# 初始化实盘交易记录表 (基准起点: 2026-02-13)
 if 'trade_history' not in st.session_state:
     st.session_state.trade_history = pd.DataFrame({
         "Date": [datetime.date(2026, 2, 13)],
         "Action": ["买入"],
-        "Asset": ["513520 (日经ETF)"],
-        "Price": [1.00], # 假设初始买入价，后续计算按比例折算
+        "Asset": ["日经ETF"], # 这里的名字必须与 DEFAULT_ASSETS 的 value 一致
+        "Price": [1.00],      # 仅作记录，实际计算将按真实收盘价和基准折算
         "Volume": [943100.0],
         "Cash_Flow": [-943100.0]
     })
 
-# ================= 2. 彻底修复的数据获取逻辑 =================
+# ================= 2. 双路热备数据获取逻辑 =================
 
 def calculate_rsi_series(series, period=14):
     delta = series.diff()
@@ -58,7 +58,7 @@ def calculate_rsi_series(series, period=14):
 
 @st.cache_data(ttl=3600)
 def get_clean_data(assets_dict, start_date, end_date):
-    """纯 AKShare 抓取逻辑，完美适配南方原油等所有场内标的"""
+    """双路热备：AKShare 优先，YFinance 兜底 (完美解决云端被墙)"""
     targets = {**assets_dict, **BENCHMARKS}
     fetch_start = start_date - timedelta(days=365) 
     s_date_str = fetch_start.strftime("%Y%m%d")
@@ -69,29 +69,49 @@ def get_clean_data(assets_dict, start_date, end_date):
     status_text = st.empty()
     total = len(targets)
     
-    for i, (code, name) in enumerate(targets.items()):
-        status_text.text(f"正在抓取 ({i+1}/{total}): {name} ({code})...")
+    for i, (ticker, name) in enumerate(targets.items()):
+        status_text.text(f"正在抓取 ({i+1}/{total}): {name}...")
         progress_bar.progress((i + 1) / total)
+        series_data = None
         
+        # 提取纯数字代码供 AKShare 使用
+        code_num = ticker.split('.')[0] 
+        
+        # [路线 1]: 尝试国内接口 (AKShare)
         try:
-            # 统一使用东方财富历史数据接口
-            df_ak = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=s_date_str, end_date=e_date_str, adjust="hfq")
+            df_ak = ak.fund_etf_hist_em(symbol=code_num, period="daily", start_date=s_date_str, end_date=e_date_str, adjust="hfq")
             if not df_ak.empty:
                 df_ak['date'] = pd.to_datetime(df_ak['日期'])
-                df_ak.set_index('date', inplace=True)
-                series_data = df_ak['收盘']
-                series_data.name = name
-                combined_df = pd.merge(combined_df, series_data, left_index=True, right_index=True, how='outer')
-        except Exception as e:
-            pass
+                series_data = df_ak.set_index('date')['收盘']
+        except: 
+            pass # 被墙或失败则静默跳过
             
-        time.sleep(0.2) # 防止请求过快被封
+        # [路线 2]: 如果路线 1 失败，立即触发 YFinance 兜底
+        if series_data is None or series_data.empty:
+            try:
+                df_yf = yf.download(ticker, start=fetch_start, end=end_date + timedelta(days=1), progress=False)
+                if not df_yf.empty:
+                    if isinstance(df_yf.columns, pd.MultiIndex):
+                        try: series_data = df_yf[('Adj Close', ticker)]
+                        except: series_data = df_yf.iloc[:, 0] 
+                    else:
+                        series_data = df_yf['Adj Close'] if 'Adj Close' in df_yf.columns else df_yf['Close']
+                    if series_data.index.tz is not None:
+                        series_data.index = series_data.index.tz_localize(None)
+            except: 
+                pass
+
+        if series_data is not None and not series_data.empty:
+            series_data.name = name 
+            combined_df = pd.merge(combined_df, series_data, left_index=True, right_index=True, how='outer')
+            
+        time.sleep(0.1) # 保护接口
     
     progress_bar.empty()
     status_text.empty()
     if combined_df.empty: return pd.DataFrame()
 
-    hs300_name = BENCHMARKS.get("510300", "沪深300")
+    hs300_name = BENCHMARKS.get("510300.SS", "沪深300")
     if hs300_name in combined_df.columns:
         valid_a_share_dates = combined_df[hs300_name].dropna().index
         combined_df = combined_df.loc[valid_a_share_dates]
@@ -100,7 +120,7 @@ def get_clean_data(assets_dict, start_date, end_date):
     return combined_df
 
 def run_strategy_engine(df_all, assets, params, user_start_date, use_rsi_filter=False, use_acc_filter=False):
-    """核心策略回测引擎保持不变"""
+    """带停牌微观过滤的策略引擎"""
     rs, rl, rw = params['rs'], params['rl'], params['rw']
     h, m = params['h'], params['m']
     rsi_p, rsi_limit = params['rsi_period'], params['rsi_limit']
@@ -168,36 +188,31 @@ def run_strategy_engine(df_all, assets, params, user_start_date, use_rsi_filter=
 
 # ================= 3. 实盘净值计算引擎 =================
 def calculate_real_portfolio(df_prices, trade_history, start_date_str="2026-02-13", initial_nav=1.0):
-    """根据手动交易记录，结合真实行情计算每日净资产和基准净值"""
+    """根据手动交易记录，结合真实行情计算每日绝对净资产"""
     if df_prices.empty or trade_history.empty:
         return None
         
     start_dt = pd.to_datetime(start_date_str)
-    # 截取起始日之后的真实行情
     df_p = df_prices.loc[df_prices.index >= start_dt].copy()
     if df_p.empty: return None
 
-    # 初始化持仓和现金
     positions = {name: 0.0 for name in DEFAULT_ASSETS.values()}
     cash = 0.0
-    
     daily_total_value = []
     
     for current_date in df_p.index:
         current_date_date = current_date.date()
-        
-        # 处理当天的交易
         day_trades = trade_history[pd.to_datetime(trade_history['Date']).dt.date == current_date_date]
+        
         for _, trade in day_trades.iterrows():
-            asset_name = trade['Asset'].split(" ")[-1].strip("()")
-            if trade['Action'] == "买入":
+            asset_name = trade['Asset']
+            if trade['Action'] == "买入" and asset_name in positions:
                 positions[asset_name] += trade['Volume']
                 cash += trade['Cash_Flow']
-            elif trade['Action'] == "卖出":
+            elif trade['Action'] == "卖出" and asset_name in positions:
                 positions[asset_name] -= trade['Volume']
                 cash += trade['Cash_Flow']
 
-        # 计算当日收盘总市值
         market_value = 0.0
         for asset, vol in positions.items():
             if vol > 0 and asset in df_p.columns:
@@ -206,12 +221,11 @@ def calculate_real_portfolio(df_prices, trade_history, start_date_str="2026-02-1
         total_assets = cash + market_value
         daily_total_value.append(total_assets)
         
-    res_df = pd.DataFrame({
-        "Total_Assets": daily_total_value
-    }, index=df_p.index)
+    res_df = pd.DataFrame({"Total_Assets": daily_total_value}, index=df_p.index)
     
-    # 将第一天的总资产折算为起始净值 1.00
+    # 将第一天收盘时的总资产定义为初始基准净值 (1.00)
     initial_assets = res_df['Total_Assets'].iloc[0]
+    if initial_assets == 0: initial_assets = 1 # 防止除以0
     res_df['Real_NAV'] = (res_df['Total_Assets'] / initial_assets) * initial_nav
     
     return res_df
@@ -248,16 +262,16 @@ st.title("🧪 动能工厂 - 实盘追踪版 🚀")
 df = get_clean_data(st.session_state.my_assets, start_d, end_d)
 
 if df.empty:
-    st.error("❌ 数据获取失败。请检查网络。")
+    st.error("❌ 数据获取失败。请检查海外网络拦截或 API 限制。")
 else:
     tab1, tab2, tab3 = st.tabs(["💰 个人实盘资金曲线", "📈 策略每日诊断播报", "⚙️ 历史全回测曲线"])
     
     # ---------------- 页面 1：实盘资金曲线与记账 ----------------
     with tab1:
         st.markdown("### 📝 手动实盘调仓记录表")
-        st.info("💡 初始基准日：2026年2月13日，起始净值约定为 1.0000。请在这里录入你真实的买卖操作。")
+        st.info("💡 初始基准日：2026年2月13日，起始净值约定为 1.0000。资产名称必须与右侧下拉框一致。负数 Cash_Flow 代表买入花钱，正数代表卖出收钱。")
         
-        # 记录表单展示
+        # 记录表单展示 (支持交互式增删改)
         edited_df = st.data_editor(st.session_state.trade_history, num_rows="dynamic", use_container_width=True)
         st.session_state.trade_history = edited_df
         
@@ -269,7 +283,7 @@ else:
                 current_nav = real_nav_df['Real_NAV'].iloc[-1]
                 st.metric(label="当前实盘绝对净值", value=f"{current_nav:.4f}", delta=f"{(current_nav-1.0):.2%}")
                 
-                # 绘制带买卖点标记的实盘资金曲线
+                # 绘制实盘资金曲线
                 fig_real = go.Figure()
                 fig_real.add_trace(go.Scatter(x=real_nav_df.index, y=real_nav_df['Real_NAV'], name="实盘净值", line=dict(color='#ff00ff', width=3)))
                 
@@ -277,10 +291,9 @@ else:
                 trade_dates = pd.to_datetime(st.session_state.trade_history['Date']).dt.date
                 for dt in trade_dates:
                     try:
-                        # 找到最近的交易日
                         valid_dt = real_nav_df.index[real_nav_df.index.date >= dt][0]
                         nav_val = real_nav_df.loc[valid_dt, 'Real_NAV']
-                        fig_real.add_annotation(x=valid_dt, y=nav_val, text="🔄 调仓", showarrow=True, arrowhead=1)
+                        fig_real.add_annotation(x=valid_dt, y=nav_val, text="🔄 调仓", showarrow=True, arrowhead=1, ax=0, ay=-40)
                     except: pass
                     
                 fig_real.update_layout(height=400, template="plotly_dark", title="📈 账户绝对净值走势 (基准 1.00)")
@@ -346,7 +359,6 @@ else:
                     .map(color_row, subset=['状态']), use_container_width=True, height=400
                 )
                 
-                # 直观的大标题提示
                 if real_holdings:
                     st.success(f"🎯 **策略明示：当前应当重点持仓 👉 {', '.join(real_holdings)}**")
                 else:
@@ -360,4 +372,3 @@ else:
             fig_backtest.add_trace(go.Scatter(x=nav_new.index, y=nav_new, name="纯策略理论净值", line=dict(color='#00ff88', width=2)))
             fig_backtest.update_layout(height=400, template="plotly_dark", title="理论策略全历史回测曲线")
             st.plotly_chart(fig_backtest, use_container_width=True)
-
