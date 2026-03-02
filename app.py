@@ -57,111 +57,83 @@ def calculate_rsi_series(series, period=14):
 
 @st.cache_data(ttl=3600)
 def get_clean_data(assets_dict, start_date, end_date):
+    import yfinance as yf
     import requests
     import pandas as pd
-    from datetime import timedelta
     import time
-    import yfinance as yf
-    import io
 
-    targets = {**assets_dict, **BENCHMARKS}
     combined_df = pd.DataFrame()
-    
+    error_logs = []
+
     progress_bar = st.progress(0)
-    status_text = st.empty()
-    error_logs = []  # 错误追踪器
-    total = len(targets)
+    total = len(assets_dict)
 
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-
-    for i, (ticker, name) in enumerate(targets.items()):
-        status_text.text(f"📡 正在探测 ({i+1}/{total}): {name}...")
+    for i, (ticker, name) in enumerate(assets_dict.items()):
         progress_bar.progress((i + 1) / total)
+        series = None
         
-        code_num = ticker.split('.')[0]
-        series_data = None
-        
-        # 【路线 1】：东方财富 HTTPS
-        try:
-            market_flag = '1' if code_num.startswith(('5', '6')) else '0'
-            secid = f"{market_flag}.{code_num}"
-            url = f"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53&klt=101&fqt=2&end=20500101&lmt=1000"
-            res = requests.get(url, headers=headers, timeout=4)
-            data = res.json()
-            if data.get('data') and data['data'].get('klines'):
-                dates, closes = [], []
-                for k in data['data']['klines']:
-                    parts = k.split(',')
-                    dates.append(parts[0])
-                    closes.append(float(parts[2]))
-                df_temp = pd.DataFrame({'date': pd.to_datetime(dates), name: closes})
-                series_data = df_temp.set_index('date')[name]
-        except Exception as e:
-            error_logs.append(f"东财 [{name}]: {str(e)}")
-
-        # 【路线 2】：网易财经 CSV (东财失败时触发)
-        if series_data is None or series_data.empty:
+        # 🟢 1. 专门为南方原油开辟绝对通道 (东财底层 API)
+        if "501018" in ticker:
             try:
-                ntes_prefix = '0' if code_num.startswith(('5', '6')) else '1'
-                ntes_code = f"{ntes_prefix}{code_num}"
-                s_str = (start_date - timedelta(days=365)).strftime("%Y%m%d")
-                e_str = (end_date + timedelta(days=1)).strftime("%Y%m%d")
-                url_163 = f"http://quotes.money.163.com/service/chddata.html?code={ntes_code}&start={s_str}&end={e_str}&fields=TCLOSE"
-                res_163 = requests.get(url_163, headers=headers, timeout=5)
-                if res_163.status_code == 200 and len(res_163.text) > 50:
-                    df_ntes = pd.read_csv(io.StringIO(res_163.text), encoding='gbk')
-                    if not df_ntes.empty and '收盘价' in df_ntes.columns:
-                        df_ntes['日期'] = pd.to_datetime(df_ntes['日期'])
-                        df_ntes = df_ntes[df_ntes['收盘价'] > 0]
-                        series_data = df_ntes.set_index('日期')['收盘价'].astype(float).sort_index()
-                        series_data.name = name
+                url = "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=1.501018&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53&klt=101&fqt=2&end=20500101&lmt=1000"
+                res = requests.get(url, timeout=5).json()
+                klines = res['data']['klines']
+                dates = [k.split(',')[0] for k in klines]
+                closes = [float(k.split(',')[2]) for k in klines]
+                series = pd.Series(closes, index=pd.to_datetime(dates), name=name)
             except Exception as e:
-                error_logs.append(f"网易 [{name}]: {str(e)}")
+                error_logs.append(f"南方原油抓取失败: {e}")
+        
+        # 🔵 2. 其他 ETF 使用最稳定的 yf.Ticker() 单只拉取，避开批量下载的错乱 bug
+        else:
+            try:
+                # 兼容 Yahoo 对国内 ETF 的后缀习惯
+                yf_ticker = ticker if ".SS" in ticker else ticker.replace(".SZ", ".SS")
+                tk = yf.Ticker(yf_ticker)
+                df_yf = tk.history(period="2y") # 简单粗暴直接拉取近2年
                 
-        # 【路线 3】：YFinance (终极兜底)
-        if series_data is None or series_data.empty:
-            try:
-                df_yf = yf.download(ticker, start=start_date - timedelta(days=365), end=end_date + timedelta(days=1), progress=False)
                 if not df_yf.empty:
-                    if isinstance(df_yf.columns, pd.MultiIndex):
-                        try: series_data = df_yf[('Adj Close', ticker)]
-                        except: series_data = df_yf.iloc[:, 0]
-                    else:
-                        series_data = df_yf['Adj Close'] if 'Adj Close' in df_yf.columns else df_yf['Close']
-                    if series_data.index.tz is not None:
-                        series_data.index = series_data.index.tz_localize(None)
-                    series_data.name = name
+                    series = df_yf['Close']
+                    # 去除时区，纯净对齐
+                    if series.index.tz is not None:
+                        series.index = series.index.tz_localize(None)
+                    series.index = series.index.normalize()
+                    series.name = name
             except Exception as e:
-                error_logs.append(f"YF [{name}]: {str(e)}")
+                error_logs.append(f"{name} 抓取失败: {e}")
 
-        # 合并数据
-        if series_data is not None and not series_data.empty:
+        # 🟡 3. 数据安全合并
+        if series is not None and not series.empty:
+            # 剔除可能存在的 0 或负数异常值
+            series = series[series > 0]
             if combined_df.empty:
-                combined_df = pd.DataFrame({name: series_data})
+                combined_df = pd.DataFrame({name: series})
             else:
-                combined_df = combined_df.join(series_data, how='outer')
-
-        time.sleep(0.1)
+                combined_df = combined_df.join(series, how='outer')
+                
+        time.sleep(0.2) # 防止请求过快被封
 
     progress_bar.empty()
-    status_text.empty()
+
+    # 🚨 如果有任何标的失败，直接在 UI 顶端红色警告打印原因！
+    if error_logs:
+        st.error("⚠️ 部分数据缺失诊断日志：\n" + "\n".join(error_logs))
+
+    if combined_df.empty:
+        return combined_df
+
+    # 🛠️ 核心修复：强制日期正序排列，否则算出来的动能全部为负！
+    combined_df = combined_df.sort_index(ascending=True)
     
-    # 🚨 如果全盘失败，把具体错误打印在网页上！
-    if combined_df.empty and error_logs:
-        st.error("数据三路抓取均失败，拦截日志如下：\n\n" + "\n".join(error_logs[:10]))
-        return pd.DataFrame()
-
-    if not combined_df.empty:
-        hs300_name = BENCHMARKS.get("510300.SS", "沪深300")
-        if hs300_name in combined_df.columns:
-            valid_dates = combined_df[hs300_name].dropna().index
-            combined_df = combined_df.loc[combined_df.index.intersection(valid_dates)]
-        combined_df = combined_df.sort_index().ffill().dropna(how='all')
-        mask = (combined_df.index >= pd.to_datetime(start_date) - timedelta(days=365)) & \
-               (combined_df.index <= pd.to_datetime(end_date) + timedelta(days=1))
-        combined_df = combined_df.loc[mask]
-
-    return combined_df
+    # 填补交易日缺口
+    combined_df = combined_df.ffill().dropna(how='all')
+    
+    # 裁剪到用户需要的时间范围
+    start_dt = pd.to_datetime(start_date) - pd.Timedelta(days=365) # 预留计算长均线的提前量
+    end_dt = pd.to_datetime(end_date) + pd.Timedelta(days=1)
+    
+    mask = (combined_df.index >= start_dt) & (combined_df.index <= end_dt)
+    return combined_df.loc[mask]
 
 # ================= 3. 策略核心逻辑 =================
 def run_strategy_engine(df_all, assets, params, user_start_date):
