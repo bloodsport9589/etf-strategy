@@ -1,12 +1,11 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
-import datetime
-import plotly.graph_objects as go
 import numpy as np
+import datetime
+from datetime import timedelta
+import plotly.graph_objects as go
 import requests
 import time
-from datetime import timedelta
 
 # ================= 1. 基础配置 & 默认参数 =================
 st.set_page_config(page_title="全球动能工厂-实盘追踪版", page_icon="🏭", layout="wide")
@@ -27,24 +26,26 @@ DEFAULT_ASSETS = {
     "512400.SS": "有色ETF", "159981.SZ": "豆粕ETF", "588050.SS": "科创50",
     "501018.SS": "南方原油" 
 }
+# 沪深300作为交易日历基准
 BENCHMARKS = {"510300.SS": "沪深300"}
 
 if 'my_assets' not in st.session_state:
     st.session_state.my_assets = DEFAULT_ASSETS.copy()
 
-# 初始化实盘交易记录表 (无 Cash_Flow 列，后台自动计算)
+# 初始化实盘交易记录表 (后台自动计算现金流)
 if 'trade_history' not in st.session_state:
     st.session_state.trade_history = pd.DataFrame({
         "Date": [datetime.date(2026, 2, 13)],
         "Action": ["买入"],
         "Asset": ["日经ETF"], 
         "Price": [1.000],      
-        "Volume": [943100.0]
+        "Volume": [10000.0]
     })
 
-# ================= 2. 腾讯直连引擎 (海外IP防屏蔽) =================
+# ================= 2. 核心算法与数据引擎 =================
 
 def calculate_rsi_series(series, period=14):
+    """计算 RSI 指标"""
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).fillna(0)
     loss = (-delta.where(delta < 0, 0)).fillna(0)
@@ -57,88 +58,73 @@ def calculate_rsi_series(series, period=14):
 @st.cache_data(ttl=3600)
 def get_clean_data(assets_dict, start_date, end_date):
     """
-    终极容错版数据引擎：
-    1. 首选 YFinance (修复了 .SZ 被错误替换的致命 Bug)
-    2. 备选 网易财经 CSV 接口 (专门拯救被 YF 漏掉的南方原油 LOF，海外 IP 不被墙)
+    终极防屏蔽版数据引擎：彻底抛弃 YFinance 和 AKShare。
+    直接裸连东方财富底层 CDN 接口，不封海外 IP，支持所有境内 ETF 和 LOF，自带后复权。
     """
-    import requests
-    import io
-    from datetime import timedelta
-    import time
-    
     targets = {**assets_dict, **BENCHMARKS}
-    fetch_start = start_date - timedelta(days=365)
-    
     combined_df = pd.DataFrame()
+    
     progress_bar = st.progress(0)
     status_text = st.empty()
     total = len(targets)
-    
+
+    # 伪装请求头，防止被拦截
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+
     for i, (ticker, name) in enumerate(targets.items()):
-        status_text.text(f"正在抓取 ({i+1}/{total}): {name}...")
+        status_text.text(f"🚀 正在通过东财底层通道直连 ({i+1}/{total}): {name}...")
         progress_bar.progress((i + 1) / total)
-        series_data = None
-        
-        # [路线 1]: 优先使用 YFinance (全球节点可用，修复了后缀 BUG)
+
+        code_num = ticker.split('.')[0]
+        # 东财 SecID 规则：沪市(5,6开头)为1，深市(1,0,3开头)为0
+        market_flag = '1' if code_num.startswith(('5', '6')) else '0'
+        secid = f"{market_flag}.{code_num}"
+
+        # API: klt=101(日K), fqt=2(后复权), lmt=1000(近1000个交易日)
+        url = f"http://push2his.eastmoney.com/api/qt/stock/kline/get?secid={secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53&klt=101&fqt=2&end=20500101&lmt=1000"
+
         try:
-            df_yf = yf.download(ticker, start=fetch_start, end=end_date + timedelta(days=1), progress=False)
-            if not df_yf.empty:
-                # 兼容 yfinance 不同的数据返回格式
-                if isinstance(df_yf.columns, pd.MultiIndex):
-                    try: series_data = df_yf[('Adj Close', ticker)]
-                    except: series_data = df_yf.iloc[:, 0]
-                else:
-                    series_data = df_yf['Adj Close'] if 'Adj Close' in df_yf.columns else df_yf['Close']
-                
-                # 清理时区信息，保持纯净日期
-                if series_data.index.tz is not None:
-                    series_data.index = series_data.index.tz_localize(None)
-                series_data.index = pd.to_datetime(series_data.index).normalize()
-        except:
-            pass
-
-        # [路线 2]: 网易财经 CSV 兜底 (专门拯救南方原油 501018)
-        if series_data is None or series_data.empty:
-            try:
-                code_num = ticker.split('.')[0]
-                # 网易接口规则：上海标的加前缀0，深圳加前缀1
-                ntes_prefix = '0' if code_num.startswith(('5', '6')) else '1'
-                ntes_code = f"{ntes_prefix}{code_num}"
-                
-                s_str = fetch_start.strftime("%Y%m%d")
-                e_str = end_date.strftime("%Y%m%d")
-                
-                url = f"http://quotes.money.163.com/service/chddata.html?code={ntes_code}&start={s_str}&end={e_str}&fields=TCLOSE"
-                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-                res = requests.get(url, headers=headers, timeout=5)
-                
-                if res.status_code == 200 and len(res.text) > 50:
-                    df_ntes = pd.read_csv(io.StringIO(res.text), encoding='gbk')
-                    if not df_ntes.empty and '收盘价' in df_ntes.columns:
-                        df_ntes['日期'] = pd.to_datetime(df_ntes['日期'])
-                        df_ntes = df_ntes[df_ntes['收盘价'] > 0] # 剔除停牌日
-                        series_data = df_ntes.set_index('日期')['收盘价'].astype(float).sort_index()
-            except:
-                pass
-
-        if series_data is not None and not series_data.empty:
-            series_data.name = name 
-            combined_df = pd.merge(combined_df, series_data, left_index=True, right_index=True, how='outer')
+            res = requests.get(url, headers=headers, timeout=5)
+            data = res.json()
             
+            if data.get('data') and data['data'].get('klines'):
+                klines = data['data']['klines']
+                # 解析 klines: "2026-02-27,开盘,收盘,最高,最低,成交量..."
+                dates, closes = [], []
+                for k in klines:
+                    parts = k.split(',')
+                    dates.append(parts[0])
+                    closes.append(float(parts[2])) # 索引2是收盘价
+
+                df_temp = pd.DataFrame({'date': pd.to_datetime(dates), name: closes})
+                df_temp.set_index('date', inplace=True)
+
+                if combined_df.empty:
+                    combined_df = df_temp
+                else:
+                    combined_df = combined_df.join(df_temp, how='outer')
+        except Exception as e:
+            pass 
+
         time.sleep(0.1) 
-    
+
     progress_bar.empty()
     status_text.empty()
-    if combined_df.empty: return pd.DataFrame()
 
-    # 裁剪并清理数据：使用沪深300作为交易日历基准
-    hs300_name = BENCHMARKS.get("510300.SS", "沪深300")
-    if hs300_name in combined_df.columns:
-        valid_a_share_dates = combined_df[hs300_name].dropna().index
-        combined_df = combined_df.loc[combined_df.index.intersection(valid_a_share_dates)]
+    if not combined_df.empty:
+        # 对齐沪深300交易日历，清理空值
+        hs300_name = BENCHMARKS.get("510300.SS", "沪深300")
+        if hs300_name in combined_df.columns:
+            valid_dates = combined_df[hs300_name].dropna().index
+            combined_df = combined_df.loc[combined_df.index.intersection(valid_dates)]
+            
+        combined_df = combined_df.sort_index().ffill().dropna(how='all')
+        mask = (combined_df.index >= pd.to_datetime(start_date) - timedelta(days=365)) & \
+               (combined_df.index <= pd.to_datetime(end_date) + timedelta(days=1))
+        combined_df = combined_df.loc[mask]
 
-    combined_df = combined_df.sort_index().ffill().dropna(how='all')
     return combined_df
+
 # ================= 3. 策略核心逻辑 =================
 def run_strategy_engine(df_all, assets, params, user_start_date):
     """动能评分与信号过滤引擎"""
@@ -172,7 +158,7 @@ def run_strategy_engine(df_all, assets, params, user_start_date):
     for i in range(warm_up, len(df_t) - 1):
         valid_data = np.isfinite(s_vals[i]) & np.isfinite(p_vals[i]) & np.isfinite(m_vals[i])
         
-        # 核心过滤条件：动能为正 + 站上均线 + RSI未超买 + 加速度不衰竭
+        # 核心过滤条件
         base_signal = (s_vals[i] > 0) & (p_vals[i] > m_vals[i]) & t_vals[i]
         pass_rsi = (rsi_vals[i] < rsi_limit)
         pass_acc = (acc_vals[i] > acc_limit)
@@ -209,7 +195,7 @@ def run_strategy_engine(df_all, assets, params, user_start_date):
 
 # ================= 4. 实盘净值计算引擎 =================
 def calculate_real_portfolio(df_prices, trade_history, start_date_str="2026-02-13", initial_nav=1.0):
-    """自动计算后台现金变动的实盘核心"""
+    """根据交易记录核算真实净值与现金流"""
     if df_prices.empty or trade_history.empty:
         return None, None
         
@@ -224,18 +210,15 @@ def calculate_real_portfolio(df_prices, trade_history, start_date_str="2026-02-1
     trades = trade_history.copy()
     trades['Date'] = pd.to_datetime(trades['Date']).dt.date
     
-    # 后台自动计算现金流
     def calc_cash_flow(row):
         try:
             val = float(row['Price']) * float(row['Volume'])
             return -val if row['Action'] == "买入" else val
-        except:
-            return 0.0
+        except: return 0.0
     trades['Cash_Flow'] = trades.apply(calc_cash_flow, axis=1)
     
     trades = trades.sort_values("Date")
-    trade_idx = 0
-    num_trades = len(trades)
+    trade_idx, num_trades = 0, len(trades)
     
     for current_date in df_p.index:
         current_date_date = current_date.date()
@@ -244,9 +227,7 @@ def calculate_real_portfolio(df_prices, trade_history, start_date_str="2026-02-1
             trade_date = trades.iloc[trade_idx]['Date']
             if trade_date <= current_date_date:
                 trade = trades.iloc[trade_idx]
-                
-                raw_asset_name = str(trade['Asset'])
-                matched_name = next((name for name in positions.keys() if name in raw_asset_name), None)
+                matched_name = next((name for name in positions.keys() if name in str(trade['Asset'])), None)
                         
                 if matched_name:
                     if trade['Action'] == "买入":
@@ -276,7 +257,7 @@ with st.sidebar:
     with st.expander("当前动能与风控参数", expanded=True):
         rs = st.slider("短期周期 (Fast)", 5, 60, st.session_state['rs'])
         rl = st.slider("长期周期 (Slow)", 30, 250, st.session_state['rl'])
-        rw = st.slider("短期权重", 0, 100, st.session_state['rw']) / 100.0
+        rw = st.slider("短期权重", 0, 100, int(st.session_state['rw']*100)) / 100.0
         h = st.number_input("持仓数量", 1, 10, st.session_state['h'])
         m = st.number_input("均线防守 (MA)", 5, 120, st.session_state['m'])
         rsi_limit = st.slider("RSI 熔断上限", 50, 95, st.session_state['rsi_limit'])
