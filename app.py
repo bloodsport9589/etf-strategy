@@ -57,67 +57,105 @@ def calculate_rsi_series(series, period=14):
 
 @st.cache_data(ttl=3600)
 def get_clean_data(assets_dict, start_date, end_date):
-    """
-    终极防屏蔽版数据引擎：彻底抛弃 YFinance 和 AKShare。
-    直接裸连东方财富底层 CDN 接口，不封海外 IP，支持所有境内 ETF 和 LOF，自带后复权。
-    """
+    import requests
+    import pandas as pd
+    from datetime import timedelta
+    import time
+    import yfinance as yf
+    import io
+
     targets = {**assets_dict, **BENCHMARKS}
     combined_df = pd.DataFrame()
     
     progress_bar = st.progress(0)
     status_text = st.empty()
+    error_logs = []  # 错误追踪器
     total = len(targets)
 
-    # 伪装请求头，防止被拦截
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 
     for i, (ticker, name) in enumerate(targets.items()):
-        status_text.text(f"🚀 正在通过东财底层通道直连 ({i+1}/{total}): {name}...")
+        status_text.text(f"📡 正在探测 ({i+1}/{total}): {name}...")
         progress_bar.progress((i + 1) / total)
-
+        
         code_num = ticker.split('.')[0]
-        # 东财 SecID 规则：沪市(5,6开头)为1，深市(1,0,3开头)为0
-        market_flag = '1' if code_num.startswith(('5', '6')) else '0'
-        secid = f"{market_flag}.{code_num}"
-
-        # API: klt=101(日K), fqt=2(后复权), lmt=1000(近1000个交易日)
-        url = f"http://push2his.eastmoney.com/api/qt/stock/kline/get?secid={secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53&klt=101&fqt=2&end=20500101&lmt=1000"
-
+        series_data = None
+        
+        # 【路线 1】：东方财富 HTTPS
         try:
-            res = requests.get(url, headers=headers, timeout=5)
+            market_flag = '1' if code_num.startswith(('5', '6')) else '0'
+            secid = f"{market_flag}.{code_num}"
+            url = f"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53&klt=101&fqt=2&end=20500101&lmt=1000"
+            res = requests.get(url, headers=headers, timeout=4)
             data = res.json()
-            
             if data.get('data') and data['data'].get('klines'):
-                klines = data['data']['klines']
-                # 解析 klines: "2026-02-27,开盘,收盘,最高,最低,成交量..."
                 dates, closes = [], []
-                for k in klines:
+                for k in data['data']['klines']:
                     parts = k.split(',')
                     dates.append(parts[0])
-                    closes.append(float(parts[2])) # 索引2是收盘价
-
+                    closes.append(float(parts[2]))
                 df_temp = pd.DataFrame({'date': pd.to_datetime(dates), name: closes})
-                df_temp.set_index('date', inplace=True)
-
-                if combined_df.empty:
-                    combined_df = df_temp
-                else:
-                    combined_df = combined_df.join(df_temp, how='outer')
+                series_data = df_temp.set_index('date')[name]
         except Exception as e:
-            pass 
+            error_logs.append(f"东财 [{name}]: {str(e)}")
 
-        time.sleep(0.1) 
+        # 【路线 2】：网易财经 CSV (东财失败时触发)
+        if series_data is None or series_data.empty:
+            try:
+                ntes_prefix = '0' if code_num.startswith(('5', '6')) else '1'
+                ntes_code = f"{ntes_prefix}{code_num}"
+                s_str = (start_date - timedelta(days=365)).strftime("%Y%m%d")
+                e_str = (end_date + timedelta(days=1)).strftime("%Y%m%d")
+                url_163 = f"http://quotes.money.163.com/service/chddata.html?code={ntes_code}&start={s_str}&end={e_str}&fields=TCLOSE"
+                res_163 = requests.get(url_163, headers=headers, timeout=5)
+                if res_163.status_code == 200 and len(res_163.text) > 50:
+                    df_ntes = pd.read_csv(io.StringIO(res_163.text), encoding='gbk')
+                    if not df_ntes.empty and '收盘价' in df_ntes.columns:
+                        df_ntes['日期'] = pd.to_datetime(df_ntes['日期'])
+                        df_ntes = df_ntes[df_ntes['收盘价'] > 0]
+                        series_data = df_ntes.set_index('日期')['收盘价'].astype(float).sort_index()
+                        series_data.name = name
+            except Exception as e:
+                error_logs.append(f"网易 [{name}]: {str(e)}")
+                
+        # 【路线 3】：YFinance (终极兜底)
+        if series_data is None or series_data.empty:
+            try:
+                df_yf = yf.download(ticker, start=start_date - timedelta(days=365), end=end_date + timedelta(days=1), progress=False)
+                if not df_yf.empty:
+                    if isinstance(df_yf.columns, pd.MultiIndex):
+                        try: series_data = df_yf[('Adj Close', ticker)]
+                        except: series_data = df_yf.iloc[:, 0]
+                    else:
+                        series_data = df_yf['Adj Close'] if 'Adj Close' in df_yf.columns else df_yf['Close']
+                    if series_data.index.tz is not None:
+                        series_data.index = series_data.index.tz_localize(None)
+                    series_data.name = name
+            except Exception as e:
+                error_logs.append(f"YF [{name}]: {str(e)}")
+
+        # 合并数据
+        if series_data is not None and not series_data.empty:
+            if combined_df.empty:
+                combined_df = pd.DataFrame({name: series_data})
+            else:
+                combined_df = combined_df.join(series_data, how='outer')
+
+        time.sleep(0.1)
 
     progress_bar.empty()
     status_text.empty()
+    
+    # 🚨 如果全盘失败，把具体错误打印在网页上！
+    if combined_df.empty and error_logs:
+        st.error("数据三路抓取均失败，拦截日志如下：\n\n" + "\n".join(error_logs[:10]))
+        return pd.DataFrame()
 
     if not combined_df.empty:
-        # 对齐沪深300交易日历，清理空值
         hs300_name = BENCHMARKS.get("510300.SS", "沪深300")
         if hs300_name in combined_df.columns:
             valid_dates = combined_df[hs300_name].dropna().index
             combined_df = combined_df.loc[combined_df.index.intersection(valid_dates)]
-            
         combined_df = combined_df.sort_index().ffill().dropna(how='all')
         mask = (combined_df.index >= pd.to_datetime(start_date) - timedelta(days=365)) & \
                (combined_df.index <= pd.to_datetime(end_date) + timedelta(days=1))
