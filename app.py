@@ -56,9 +56,18 @@ def calculate_rsi_series(series, period=14):
 
 @st.cache_data(ttl=3600)
 def get_clean_data(assets_dict, start_date, end_date):
-    """主通道：腾讯财经 API (无海外屏蔽，带后复权)。备用：YFinance"""
+    """
+    终极容错版数据引擎：
+    1. 首选 YFinance (修复了 .SZ 被错误替换的致命 Bug)
+    2. 备选 网易财经 CSV 接口 (专门拯救被 YF 漏掉的南方原油 LOF，海外 IP 不被墙)
+    """
+    import requests
+    import io
+    from datetime import timedelta
+    import time
+    
     targets = {**assets_dict, **BENCHMARKS}
-    fetch_start = start_date - timedelta(days=365) 
+    fetch_start = start_date - timedelta(days=365)
     
     combined_df = pd.DataFrame()
     progress_bar = st.progress(0)
@@ -66,51 +75,51 @@ def get_clean_data(assets_dict, start_date, end_date):
     total = len(targets)
     
     for i, (ticker, name) in enumerate(targets.items()):
-        status_text.text(f"正在通过专属通道抓取 ({i+1}/{total}): {name}...")
+        status_text.text(f"正在抓取 ({i+1}/{total}): {name}...")
         progress_bar.progress((i + 1) / total)
         series_data = None
         
-        code_num = ticker.split('.')[0] 
-        # 识别沪深前缀 (腾讯接口需要 sh/sz 前缀)
-        prefix = 'sh' if code_num.startswith(('5', '6')) else 'sz'
-        tencent_code = f"{prefix}{code_num}"
-        
-        # [路线 1]: 腾讯财经直连
+        # [路线 1]: 优先使用 YFinance (全球节点可用，修复了后缀 BUG)
         try:
-            # 抓取约 1000 个交易日的后复权 (hfq) 数据
-            url = f"http://web.ifzq.gtimg.cn/appstock/app/newiqkline/get?param={tencent_code},day,,,1000,hfq"
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-            res = requests.get(url, headers=headers, timeout=5)
-            data = res.json()
-            
-            if data['code'] == 0:
-                k_lines = data['data'][tencent_code].get('hfqday', data['data'][tencent_code].get('day', []))
-                if k_lines:
-                    df_temp = pd.DataFrame(k_lines).iloc[:, :6]
-                    df_temp.columns = ['date', 'open', 'close', 'high', 'low', 'vol']
-                    df_temp['date'] = pd.to_datetime(df_temp['date'])
-                    df_temp['close'] = df_temp['close'].astype(float)
-                    series_data = df_temp.set_index('date')['close']
-        except Exception as e:
+            df_yf = yf.download(ticker, start=fetch_start, end=end_date + timedelta(days=1), progress=False)
+            if not df_yf.empty:
+                # 兼容 yfinance 不同的数据返回格式
+                if isinstance(df_yf.columns, pd.MultiIndex):
+                    try: series_data = df_yf[('Adj Close', ticker)]
+                    except: series_data = df_yf.iloc[:, 0]
+                else:
+                    series_data = df_yf['Adj Close'] if 'Adj Close' in df_yf.columns else df_yf['Close']
+                
+                # 清理时区信息，保持纯净日期
+                if series_data.index.tz is not None:
+                    series_data.index = series_data.index.tz_localize(None)
+                series_data.index = pd.to_datetime(series_data.index).normalize()
+        except:
             pass
-            
-        # [路线 2]: YFinance 兜底 (针对特定代码做 LOF 兼容)
+
+        # [路线 2]: 网易财经 CSV 兜底 (专门拯救南方原油 501018)
         if series_data is None or series_data.empty:
             try:
-                alt_ticker = ticker if ".SS" in ticker else ticker.replace(".SZ", ".SS")
-                df_yf = yf.download(alt_ticker, start=fetch_start, end=end_date + timedelta(days=1), progress=False)
-                if df_yf.empty and "501018" in ticker:
-                     df_yf = yf.download("501018.SS", start=fetch_start, end=end_date + timedelta(days=1), progress=False)
-                     
-                if not df_yf.empty:
-                    if isinstance(df_yf.columns, pd.MultiIndex):
-                        try: series_data = df_yf[('Adj Close', alt_ticker)]
-                        except: series_data = df_yf.iloc[:, 0] 
-                    else:
-                        series_data = df_yf['Adj Close'] if 'Adj Close' in df_yf.columns else df_yf['Close']
-                    if series_data.index.tz is not None:
-                        series_data.index = series_data.index.tz_localize(None)
-            except: pass
+                code_num = ticker.split('.')[0]
+                # 网易接口规则：上海标的加前缀0，深圳加前缀1
+                ntes_prefix = '0' if code_num.startswith(('5', '6')) else '1'
+                ntes_code = f"{ntes_prefix}{code_num}"
+                
+                s_str = fetch_start.strftime("%Y%m%d")
+                e_str = end_date.strftime("%Y%m%d")
+                
+                url = f"http://quotes.money.163.com/service/chddata.html?code={ntes_code}&start={s_str}&end={e_str}&fields=TCLOSE"
+                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+                res = requests.get(url, headers=headers, timeout=5)
+                
+                if res.status_code == 200 and len(res.text) > 50:
+                    df_ntes = pd.read_csv(io.StringIO(res.text), encoding='gbk')
+                    if not df_ntes.empty and '收盘价' in df_ntes.columns:
+                        df_ntes['日期'] = pd.to_datetime(df_ntes['日期'])
+                        df_ntes = df_ntes[df_ntes['收盘价'] > 0] # 剔除停牌日
+                        series_data = df_ntes.set_index('日期')['收盘价'].astype(float).sort_index()
+            except:
+                pass
 
         if series_data is not None and not series_data.empty:
             series_data.name = name 
@@ -122,6 +131,7 @@ def get_clean_data(assets_dict, start_date, end_date):
     status_text.empty()
     if combined_df.empty: return pd.DataFrame()
 
+    # 裁剪并清理数据：使用沪深300作为交易日历基准
     hs300_name = BENCHMARKS.get("510300.SS", "沪深300")
     if hs300_name in combined_df.columns:
         valid_a_share_dates = combined_df[hs300_name].dropna().index
@@ -129,7 +139,6 @@ def get_clean_data(assets_dict, start_date, end_date):
 
     combined_df = combined_df.sort_index().ffill().dropna(how='all')
     return combined_df
-
 # ================= 3. 策略核心逻辑 =================
 def run_strategy_engine(df_all, assets, params, user_start_date):
     """动能评分与信号过滤引擎"""
