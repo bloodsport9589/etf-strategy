@@ -77,26 +77,22 @@ def get_clean_data(assets_dict, start_date, end_date):
     total = len(targets)
     error_logs = []
 
-    # 伪装正常浏览器，绝不触发 API 防火墙
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
     for i, (ticker, name) in enumerate(targets.items()):
-        status_text.text(f"🚀 正在通过静态 CDN 通道解析 ({i+1}/{total}): {name}...")
+        status_text.text(f"🚀 正在清洗与解析 ({i+1}/{total}): {name}...")
         progress_bar.progress((i + 1) / total)
         
         code_num = ticker.split('.')[0]
-        # 直接访问基金的静态 CDN 配置文件
         url = f"http://fund.eastmoney.com/pingzhongdata/{code_num}.js"
         
         try:
             res = requests.get(url, headers=headers, timeout=5)
             res.encoding = 'utf-8'
             
-            # 优先提取 Data_ACWorthTrend (累计净值，自带完美后复权)
             match = re.search(r'var Data_ACWorthTrend\s*=\s*(\[.*?\]);', res.text)
             is_ac = True
             
-            # 如果没有累计净值，降级提取 Data_netWorthTrend (单位净值)
             if not match or len(match.group(1)) < 10:
                 match = re.search(r'var Data_netWorthTrend\s*=\s*(\[.*?\]);', res.text)
                 is_ac = False
@@ -105,7 +101,6 @@ def get_clean_data(assets_dict, start_date, end_date):
                 data = json.loads(match.group(1))
                 dates, navs = [], []
                 for d in data:
-                    # 兼容两种不同格式的 JSON 数组
                     if is_ac and isinstance(d, list) and len(d) >= 2:
                         ts, val = d[0], d[1]
                     elif not is_ac and isinstance(d, dict) and 'x' in d and 'y' in d:
@@ -113,19 +108,22 @@ def get_clean_data(assets_dict, start_date, end_date):
                     else:
                         continue
                         
-                    # 剥离时区，对齐北京时间的午夜零点
+                    # 🛠️ 核心修复 1：拦截 null (NoneType) 脏数据，防止崩溃！
+                    if val is None or val == "":
+                        continue
+                        
                     dt = pd.to_datetime(ts, unit='ms', utc=True).tz_convert('Asia/Shanghai').tz_localize(None).normalize()
                     dates.append(dt)
                     navs.append(float(val))
                     
-                series = pd.Series(navs, index=dates, name=name)
-                # 剔除异常的重复日期
-                series = series[~series.index.duplicated(keep='last')]
-                
-                if combined_df.empty:
-                    combined_df = pd.DataFrame(series)
-                else:
-                    combined_df = combined_df.join(series, how='outer')
+                if dates and navs:
+                    series = pd.Series(navs, index=dates, name=name)
+                    series = series[~series.index.duplicated(keep='last')]
+                    
+                    if combined_df.empty:
+                        combined_df = pd.DataFrame({name: series})
+                    else:
+                        combined_df = combined_df.join(series, how='outer')
             else:
                 error_logs.append(f"{name} ({code_num}) 解析为空")
         except Exception as e:
@@ -140,22 +138,14 @@ def get_clean_data(assets_dict, start_date, end_date):
     if combined_df.empty:
         return combined_df
 
-    # ==========================================
-    # 终极数据清洗（绝对消灭负值 Bug）
-    # ==========================================
-    # 1. 强制正序排列（动能计算基石）
+    # 🛠️ 核心修复 2：绝对强制按时间【正序】排列（老日期在上，新日期在下）
+    # 彻底杜绝动能计算出负值的倒序陷阱！
     combined_df = combined_df.sort_index(ascending=True)
     
-    # 2. 对齐沪深300的交易日（剔除周末和非交易日）
-    hs300_name = BENCHMARKS["510300.SS"]
-    if hs300_name in combined_df.columns:
-        valid_dates = combined_df[hs300_name].dropna().index
-        combined_df = combined_df.loc[combined_df.index.intersection(valid_dates)]
-        
-    # 3. 向下填充：解决中美假期不对齐时的空值
+    # 填充空值并剔除全空行
     combined_df = combined_df.ffill().dropna(how='all')
     
-    # 4. 截取所需时间段
+    # 截取所需时间段
     mask = (combined_df.index >= start_dt) & (combined_df.index <= end_dt)
     return combined_df.loc[mask]
 
