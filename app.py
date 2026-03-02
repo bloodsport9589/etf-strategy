@@ -57,7 +57,6 @@ def calculate_rsi_series(series, period=14):
 
 @st.cache_data(ttl=3600)
 def get_clean_data(assets_dict, start_date, end_date):
-    import yfinance as yf
     import pandas as pd
     import requests
     import re
@@ -65,84 +64,98 @@ def get_clean_data(assets_dict, start_date, end_date):
     from datetime import timedelta
     import streamlit as st
 
+    # 包含沪深300基准对齐
+    BENCHMARKS = {"510300.SS": "沪深300"}
+    targets = {**assets_dict, **BENCHMARKS}
+    
     start_dt = pd.to_datetime(start_date) - timedelta(days=365)
     end_dt = pd.to_datetime(end_date) + timedelta(days=1)
     combined_df = pd.DataFrame()
 
-    # ==========================================
-    # 第一步：用 YFinance 批量抓取另外 9 只 ETF
-    # (批量抓取能强制统一时间轴，彻底杜绝数据错位导致的“动能为负”Bug)
-    # ==========================================
-    yf_tickers = [t for t in assets_dict.keys() if "501018" not in t]
-    yf_mapping = {t: name for t, name in assets_dict.items() if "501018" not in t}
-    
-    with st.spinner("🌍 正在通过国际节点矩阵化抓取主流 ETF..."):
-        try:
-            df_yf = yf.download(yf_tickers, start=start_dt, end=end_dt, progress=False)
-            if not df_yf.empty:
-                if isinstance(df_yf.columns, pd.MultiIndex):
-                    close_df = df_yf['Close']
-                else:
-                    close_df = df_yf[['Close']]
-                
-                # 重命名为中文
-                close_df = close_df.rename(columns=yf_mapping)
-                
-                # 剥离时区，化繁为简
-                if close_df.index.tz is not None:
-                    close_df.index = close_df.index.tz_localize(None)
-                close_df.index = pd.to_datetime(close_df.index).normalize()
-                combined_df = close_df
-        except Exception as e:
-            st.error(f"主流 ETF 抓取报错: {e}")
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    total = len(targets)
+    error_logs = []
 
-    # ==========================================
-    # 第二步：独家秘技！通过静态 CDN 绕过防火墙，强取南方原油
-    # ==========================================
-    with st.spinner("🛢️ 正在通过静态 CDN 通道破解南方原油数据..."):
+    # 伪装正常浏览器，绝不触发 API 防火墙
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+    for i, (ticker, name) in enumerate(targets.items()):
+        status_text.text(f"🚀 正在通过静态 CDN 通道解析 ({i+1}/{total}): {name}...")
+        progress_bar.progress((i + 1) / total)
+        
+        code_num = ticker.split('.')[0]
+        # 直接访问基金的静态 CDN 配置文件
+        url = f"http://fund.eastmoney.com/pingzhongdata/{code_num}.js"
+        
         try:
-            # 直接访问静态 js 文件，CDN 节点绝不会封禁海外 IP
-            url = "http://fund.eastmoney.com/pingzhongdata/501018.js"
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-            res = requests.get(url, headers=headers, timeout=10)
+            res = requests.get(url, headers=headers, timeout=5)
+            res.encoding = 'utf-8'
             
-            # 使用正则表达式，从 JS 代码中暴力抠出 Data_netWorthTrend 数组
-            match = re.search(r'var Data_netWorthTrend\s*=\s*(\[.*?\]);', res.text)
+            # 优先提取 Data_ACWorthTrend (累计净值，自带完美后复权)
+            match = re.search(r'var Data_ACWorthTrend\s*=\s*(\[.*?\]);', res.text)
+            is_ac = True
+            
+            # 如果没有累计净值，降级提取 Data_netWorthTrend (单位净值)
+            if not match or len(match.group(1)) < 10:
+                match = re.search(r'var Data_netWorthTrend\s*=\s*(\[.*?\]);', res.text)
+                is_ac = False
+                
             if match:
                 data = json.loads(match.group(1))
                 dates, navs = [], []
                 for d in data:
-                    # 提取毫秒级时间戳，转换为北京时间并剥离时区
-                    dt = pd.to_datetime(d['x'], unit='ms', utc=True).tz_convert('Asia/Shanghai').tz_localize(None).normalize()
+                    # 兼容两种不同格式的 JSON 数组
+                    if is_ac and isinstance(d, list) and len(d) >= 2:
+                        ts, val = d[0], d[1]
+                    elif not is_ac and isinstance(d, dict) and 'x' in d and 'y' in d:
+                        ts, val = d['x'], d['y']
+                    else:
+                        continue
+                        
+                    # 剥离时区，对齐北京时间的午夜零点
+                    dt = pd.to_datetime(ts, unit='ms', utc=True).tz_convert('Asia/Shanghai').tz_localize(None).normalize()
                     dates.append(dt)
-                    navs.append(float(d['y']))
+                    navs.append(float(val))
+                    
+                series = pd.Series(navs, index=dates, name=name)
+                # 剔除异常的重复日期
+                series = series[~series.index.duplicated(keep='last')]
                 
-                oil_series = pd.Series(navs, index=dates, name="南方原油")
-                oil_series = oil_series[~oil_series.index.duplicated(keep='last')]
-                
-                # 安全合并到总表中
                 if combined_df.empty:
-                    combined_df = pd.DataFrame(oil_series)
+                    combined_df = pd.DataFrame(series)
                 else:
-                    combined_df = combined_df.join(oil_series, how='outer')
+                    combined_df = combined_df.join(series, how='outer')
             else:
-                st.warning("⚠️ CDN 解析失败，未找到原油数据。")
+                error_logs.append(f"{name} ({code_num}) 解析为空")
         except Exception as e:
-            st.error(f"南方原油突破失败: {e}")
+            error_logs.append(f"{name} 提取报错: {e}")
 
-    # ==========================================
-    # 第三步：终极数据融合与洗牌
-    # ==========================================
+    progress_bar.empty()
+    status_text.empty()
+
+    if error_logs:
+        st.warning("⚠️ 部分 CDN 解析出现异常:\n" + "\n".join(error_logs))
+
     if combined_df.empty:
         return combined_df
 
-    # 1. 强制按日期正序排列（必须正序，否则算出负收益率！）
+    # ==========================================
+    # 终极数据清洗（绝对消灭负值 Bug）
+    # ==========================================
+    # 1. 强制正序排列（动能计算基石）
     combined_df = combined_df.sort_index(ascending=True)
     
-    # 2. 向下填充：解决中美节假日不对齐导致的 NaN，让价格在休市时保持平稳
-    combined_df = combined_df.dropna(how='all').ffill()
+    # 2. 对齐沪深300的交易日（剔除周末和非交易日）
+    hs300_name = BENCHMARKS["510300.SS"]
+    if hs300_name in combined_df.columns:
+        valid_dates = combined_df[hs300_name].dropna().index
+        combined_df = combined_df.loc[combined_df.index.intersection(valid_dates)]
+        
+    # 3. 向下填充：解决中美假期不对齐时的空值
+    combined_df = combined_df.ffill().dropna(how='all')
     
-    # 3. 按设定日期截取
+    # 4. 截取所需时间段
     mask = (combined_df.index >= start_dt) & (combined_df.index <= end_dt)
     return combined_df.loc[mask]
 
