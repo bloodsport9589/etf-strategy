@@ -57,101 +57,92 @@ def calculate_rsi_series(series, period=14):
 
 @st.cache_data(ttl=3600)
 def get_clean_data(assets_dict, start_date, end_date):
+    import yfinance as yf
     import pandas as pd
     import requests
     import re
-    import json
     from datetime import timedelta
     import streamlit as st
 
-    # 包含沪深300基准对齐
-    BENCHMARKS = {"510300.SS": "沪深300"}
-    targets = {**assets_dict, **BENCHMARKS}
-    
     start_dt = pd.to_datetime(start_date) - timedelta(days=365)
     end_dt = pd.to_datetime(end_date) + timedelta(days=1)
     combined_df = pd.DataFrame()
 
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    total = len(targets)
-    error_logs = []
-
-    # 伪装正常浏览器，绝不触发 API 防火墙
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-
-    # 🚀 全军出击：所有标的统一使用东方财富 CDN
-    for i, (ticker, name) in enumerate(targets.items()):
-        status_text.text(f"🚀 正在通过东财 CDN 获取 ({i+1}/{total}): {name}...")
-        progress_bar.progress((i + 1) / total)
-        
-        code_num = ticker.split('.')[0]
-        url = f"http://fund.eastmoney.com/pingzhongdata/{code_num}.js"
-        
+    # ==========================================
+    # 引擎 1：YFinance 国际矩阵 (剔除复权 Bug)
+    # ==========================================
+    # 排除 501018，同时加入沪深 300 作为对齐基准
+    yf_mapping = {t: name for t, name in assets_dict.items() if "501018" not in t}
+    yf_mapping["510300.SS"] = "沪深300"
+    yf_tickers = list(yf_mapping.keys())
+    
+    with st.spinner("🌍 正在通过国际矩阵提取主流 ETF (强行锁定真实成交价)..."):
         try:
-            res = requests.get(url, headers=headers, timeout=5)
-            res.encoding = 'utf-8'
+            # 批量下载，强制对齐时间轴
+            df_yf = yf.download(yf_tickers, start=start_dt, end=end_dt, progress=False)
             
-            # 优先提取 Data_ACWorthTrend (累计净值，自带完美后复权)
-            match = re.search(r'var Data_ACWorthTrend\s*=\s*(\[.*?\]);', res.text)
-            is_ac = True
-            
-            # 如果没有累计净值，降级提取单位净值
-            if not match or len(match.group(1)) < 10:
-                match = re.search(r'var Data_netWorthTrend\s*=\s*(\[.*?\]);', res.text)
-                is_ac = False
+            if not df_yf.empty:
+                # 🚨 核心杀招：坚决只取 'Close' 列，彻底抛弃导致 -78% 的 Adj Close 脏数据！
+                if isinstance(df_yf.columns, pd.MultiIndex):
+                    if 'Close' in df_yf.columns.levels[0]:
+                        close_df = df_yf.xs('Close', level=0, axis=1)
+                    else:
+                        close_df = df_yf.iloc[:, 0:len(yf_tickers)]
+                else:
+                    close_df = df_yf
                 
-            if match:
-                data = json.loads(match.group(1))
-                dates, navs = [], []
-                for d in data:
-                    if is_ac and isinstance(d, list) and len(d) >= 2:
-                        ts, val = d[0], d[1]
-                    elif not is_ac and isinstance(d, dict) and 'x' in d and 'y' in d:
-                        ts, val = d['x'], d['y']
-                    else:
-                        continue
-                        
-                    # 🛡️ 核心修复：直接拦截 None (null) 脏数据，纳指和科创50不再崩溃！
-                    if val is None or val == "":
-                        continue
-                        
-                    dt = pd.to_datetime(ts, unit='ms', utc=True).tz_convert('Asia/Shanghai').tz_localize(None).normalize()
-                    dates.append(dt)
-                    navs.append(float(val))
-                    
-                if dates and navs:
-                    series = pd.Series(navs, index=dates, name=name)
-                    series = series[~series.index.duplicated(keep='last')]
-                    
-                    if combined_df.empty:
-                        combined_df = pd.DataFrame({name: series})
-                    else:
-                        combined_df = combined_df.join(series, how='outer')
-            else:
-                error_logs.append(f"{name} ({code_num}) 解析为空")
+                # 保留需要的列并重命名
+                valid_cols = [c for c in close_df.columns if c in yf_mapping]
+                close_df = close_df[valid_cols].rename(columns=yf_mapping)
+                
+                # 纯净化时间轴，剥离时区
+                if close_df.index.tz is not None:
+                    close_df.index = close_df.index.tz_localize(None)
+                close_df.index = pd.to_datetime(close_df.index).normalize()
+                combined_df = close_df
         except Exception as e:
-            error_logs.append(f"{name} 提取报错: {e}")
+            st.error(f"主流 ETF 提取异常: {e}")
 
-    progress_bar.empty()
-    status_text.empty()
+    # ==========================================
+    # 引擎 2：新浪财经无墙通道 (专克南方原油)
+    # ==========================================
+    with st.spinner("🛢️ 正在通过新浪底层接口突击抓取南方原油..."):
+        try:
+            # 新浪 API 全球无墙，极其稳定
+            url = "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=sh501018&scale=240&ma=no&datalen=1000"
+            res = requests.get(url, timeout=5)
+            
+            # 暴力正则提取，无视可能导致崩溃的 JSON 格式错误
+            dates = re.findall(r'day:"([^"]+)"', res.text)
+            closes = re.findall(r'close:"([^"]+)"', res.text)
+            
+            if dates and closes:
+                oil_series = pd.Series([float(c) for c in closes], index=pd.to_datetime(dates), name="南方原油")
+                oil_series = oil_series[~oil_series.index.duplicated(keep='last')]
+                
+                if combined_df.empty:
+                    combined_df = pd.DataFrame(oil_series)
+                else:
+                    combined_df = combined_df.join(oil_series, how='outer')
+        except Exception as e:
+            st.error(f"南方原油获取失败: {e}")
 
-    if error_logs:
-        st.warning("⚠️ 部分 CDN 解析出现异常:\n" + "\n".join(error_logs))
-
+    # ==========================================
+    # 数据总装与时序锁定
+    # ==========================================
     if combined_df.empty:
         return combined_df
 
-    # ==========================================
-    # 终极数据清洗（同源合并，绝对不再有负值 Bug！）
-    # ==========================================
-    # 1. 强制正序排列（动能计算的基石）
+    # 1. 绝对强制正序排列（保证动能计算：新价格 - 旧价格）
     combined_df = combined_df.sort_index(ascending=True)
     
-    # 2. 向下填充：平滑掉所有的节假日空缺
+    # 2. 剔除重复的幽灵日期
+    combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
+    
+    # 3. 平滑掉周末和假期的空值，让曲线连贯
     combined_df = combined_df.ffill().dropna(how='all')
     
-    # 3. 按设定日期截取
+    # 4. 截取最终结果
     mask = (combined_df.index >= start_dt) & (combined_df.index <= end_dt)
     return combined_df.loc[mask]
 
