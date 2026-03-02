@@ -59,58 +59,90 @@ def calculate_rsi_series(series, period=14):
 def get_clean_data(assets_dict, start_date, end_date):
     import yfinance as yf
     import pandas as pd
+    import requests
+    import re
+    import json
     from datetime import timedelta
     import streamlit as st
 
-    # 扩充时间以预留 60 日均线的计算量
     start_dt = pd.to_datetime(start_date) - timedelta(days=365)
     end_dt = pd.to_datetime(end_date) + timedelta(days=1)
-    
-    tickers = list(assets_dict.keys())
     combined_df = pd.DataFrame()
 
-    with st.spinner("🌍 正在通过国际节点批量构建数据矩阵 (解决错位与负值问题)..."):
+    # ==========================================
+    # 第一步：用 YFinance 批量抓取另外 9 只 ETF
+    # (批量抓取能强制统一时间轴，彻底杜绝数据错位导致的“动能为负”Bug)
+    # ==========================================
+    yf_tickers = [t for t in assets_dict.keys() if "501018" not in t]
+    yf_mapping = {t: name for t, name in assets_dict.items() if "501018" not in t}
+    
+    with st.spinner("🌍 正在通过国际节点矩阵化抓取主流 ETF..."):
         try:
-            # 🚀 核心大招：批量下载！
-            # 这会强制所有资产绑定在同一根时间轴上，彻底杜绝日期错位导致的负动能 Bug！
-            df_yf = yf.download(tickers, start=start_dt, end=end_dt, progress=False)
-            
-            if df_yf.empty:
-                st.error("YFinance 接口返回为空，请检查网络设置。")
-                return combined_df
-
-            # 解析批量下载的多层表头
-            for ticker, name in assets_dict.items():
-                try:
-                    if isinstance(df_yf.columns, pd.MultiIndex):
-                        # 统一使用 Close（未复权），避开 YF 对 A 股复权数据偶发的 100 倍缩放 Bug
-                        series = df_yf['Close'][ticker]
-                    else:
-                        series = df_yf['Close']
-                    combined_df[name] = series
-                except Exception as e:
-                    pass
+            df_yf = yf.download(yf_tickers, start=start_dt, end=end_dt, progress=False)
+            if not df_yf.empty:
+                if isinstance(df_yf.columns, pd.MultiIndex):
+                    close_df = df_yf['Close']
+                else:
+                    close_df = df_yf[['Close']]
+                
+                # 重命名为中文
+                close_df = close_df.rename(columns=yf_mapping)
+                
+                # 剥离时区，化繁为简
+                if close_df.index.tz is not None:
+                    close_df.index = close_df.index.tz_localize(None)
+                close_df.index = pd.to_datetime(close_df.index).normalize()
+                combined_df = close_df
         except Exception as e:
-            st.error(f"批量数据流中断: {e}")
-            return combined_df
+            st.error(f"主流 ETF 抓取报错: {e}")
 
+    # ==========================================
+    # 第二步：独家秘技！通过静态 CDN 绕过防火墙，强取南方原油
+    # ==========================================
+    with st.spinner("🛢️ 正在通过静态 CDN 通道破解南方原油数据..."):
+        try:
+            # 直接访问静态 js 文件，CDN 节点绝不会封禁海外 IP
+            url = "http://fund.eastmoney.com/pingzhongdata/501018.js"
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            res = requests.get(url, headers=headers, timeout=10)
+            
+            # 使用正则表达式，从 JS 代码中暴力抠出 Data_netWorthTrend 数组
+            match = re.search(r'var Data_netWorthTrend\s*=\s*(\[.*?\]);', res.text)
+            if match:
+                data = json.loads(match.group(1))
+                dates, navs = [], []
+                for d in data:
+                    # 提取毫秒级时间戳，转换为北京时间并剥离时区
+                    dt = pd.to_datetime(d['x'], unit='ms', utc=True).tz_convert('Asia/Shanghai').tz_localize(None).normalize()
+                    dates.append(dt)
+                    navs.append(float(d['y']))
+                
+                oil_series = pd.Series(navs, index=dates, name="南方原油")
+                oil_series = oil_series[~oil_series.index.duplicated(keep='last')]
+                
+                # 安全合并到总表中
+                if combined_df.empty:
+                    combined_df = pd.DataFrame(oil_series)
+                else:
+                    combined_df = combined_df.join(oil_series, how='outer')
+            else:
+                st.warning("⚠️ CDN 解析失败，未找到原油数据。")
+        except Exception as e:
+            st.error(f"南方原油突破失败: {e}")
+
+    # ==========================================
+    # 第三步：终极数据融合与洗牌
+    # ==========================================
     if combined_df.empty:
         return combined_df
 
-    # 🧹 数据清洗三板斧
-    # 1. 剥离时区，化繁为简
-    if combined_df.index.tz is not None:
-        combined_df.index = combined_df.index.tz_localize(None)
-    combined_df.index = pd.to_datetime(combined_df.index).normalize()
-    
-    # 2. 剔除重复的交易日
-    combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
-    
-    # 3. 强制正序排列，并向下填充节假日缺口（修复计算错误的最关键一步！）
+    # 1. 强制按日期正序排列（必须正序，否则算出负收益率！）
     combined_df = combined_df.sort_index(ascending=True)
-    combined_df = combined_df.ffill().dropna(how='all')
-
-    # 截取最终所需时间段
+    
+    # 2. 向下填充：解决中美节假日不对齐导致的 NaN，让价格在休市时保持平稳
+    combined_df = combined_df.dropna(how='all').ffill()
+    
+    # 3. 按设定日期截取
     mask = (combined_df.index >= start_dt) & (combined_df.index <= end_dt)
     return combined_df.loc[mask]
 
