@@ -61,7 +61,6 @@ def get_clean_data(assets_dict, start_date, end_date):
     import requests
     import pandas as pd
     import time
-    import io
 
     combined_df = pd.DataFrame()
     error_logs = []
@@ -73,33 +72,45 @@ def get_clean_data(assets_dict, start_date, end_date):
         progress_bar.progress((i + 1) / total)
         series = None
         
-        # 🟢 1. 专门为南方原油开辟通道 (东财 + 网易双保险)
+        # 🟢 1. 南方原油专属通道 (场内价格 + 场外净值双核兜底)
         if "501018" in ticker:
+            # 策略 A：添加防盗链 Referer，尝试获取场内交易价
             try:
-                # 尝试东财 HTTP 通道 (去掉了 https，防止被强制掐断)
+                headers_east = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                    "Referer": "http://quote.eastmoney.com/"  # 突破 Connection aborted 的通关密语！
+                }
                 url = "http://push2his.eastmoney.com/api/qt/stock/kline/get?secid=1.501018&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53&klt=101&fqt=2&end=20500101&lmt=1000"
-                res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5).json()
+                res = requests.get(url, headers=headers_east, timeout=5).json()
                 klines = res['data']['klines']
                 dates = [k.split(',')[0] for k in klines]
                 closes = [float(k.split(',')[2]) for k in klines]
                 series = pd.Series(closes, index=pd.to_datetime(dates), name=name)
             except Exception as e1:
-                # 东财如果还断连，无缝切换网易财经终极 CSV 通道
+                # 策略 B：如果场内价格仍被墙，直接拉取天天基金的官方净值！(海外绝对可用)
                 try:
-                    url_163 = "http://quotes.money.163.com/service/chddata.html?code=0501018&start=20200101&end=20300101&fields=TCLOSE"
-                    res_163 = requests.get(url_163, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-                    df_ntes = pd.read_csv(io.StringIO(res_163.text), encoding='gbk')
-                    df_ntes['日期'] = pd.to_datetime(df_ntes['日期'])
-                    df_ntes = df_ntes[df_ntes['收盘价'] > 0]
-                    series = df_ntes.set_index('日期')['收盘价'].astype(float).sort_index()
-                    series.name = name
+                    headers_fund = {
+                        "User-Agent": "Mozilla/5.0",
+                        "Referer": "http://fundf10.eastmoney.com/"
+                    }
+                    # pageSize=500 代表拉取近 500 个交易日的净值
+                    url_fund = "http://api.fund.eastmoney.com/f10/lsjz?fundCode=501018&pageIndex=1&pageSize=500"
+                    res_fund = requests.get(url_fund, headers=headers_fund, timeout=5).json()
+                    
+                    if res_fund.get('Data') and res_fund['Data'].get('LSJZList'):
+                        jz_list = res_fund['Data']['LSJZList']
+                        dates = [item['FSRQ'] for item in jz_list]
+                        closes = [float(item['DWJZ']) for item in jz_list if item['DWJZ']]
+                        series = pd.Series(closes, index=pd.to_datetime(dates), name=name)
+                        series = series.sort_index() # 净值是倒序的，必须排正
+                    else:
+                        raise ValueError("天天基金接口返回为空")
                 except Exception as e2:
-                    error_logs.append(f"南方原油双通道均失败: {e1} / {e2}")
+                    error_logs.append(f"南方原油彻底失败: 场内({e1}) / 净值({e2})")
         
-        # 🔵 2. 其他 ETF 恢复最原生、最干净的 Yahoo Finance 抓取
+        # 🔵 2. 其它 ETF 使用 YFinance 原生拉取
         else:
             try:
-                # 移除了所有自作聪明的后缀替换，直接用原生 ticker (如 159915.SZ)
                 tk = yf.Ticker(ticker)
                 df_yf = tk.history(period="3y") 
                 
@@ -109,14 +120,13 @@ def get_clean_data(assets_dict, start_date, end_date):
             except Exception as e:
                 error_logs.append(f"{name} 抓取失败: {e}")
 
-        # 🟡 3. 终极数据清洗与合并 (解决全员负值 Bug)
+        # 🟡 3. 数据纯净合并 (剥离时区，对齐日期)
         if series is not None and not series.empty:
-            # 剥离时区，对齐到纯净的年月日！这步极其关键！
             if series.index.tz is not None:
                 series.index = series.index.tz_localize(None)
             series.index = pd.to_datetime(series.index).normalize()
             
-            # 剔除同一天的重复数据
+            # 去除重复日期的数据
             series = series[~series.index.duplicated(keep='last')]
             
             if combined_df.empty:
@@ -124,7 +134,7 @@ def get_clean_data(assets_dict, start_date, end_date):
             else:
                 combined_df = combined_df.join(series, how='outer')
                 
-        time.sleep(0.1) 
+        time.sleep(0.1)
 
     progress_bar.empty()
 
@@ -134,10 +144,8 @@ def get_clean_data(assets_dict, start_date, end_date):
     if combined_df.empty:
         return combined_df
 
-    # 强制正序排列，彻底修复计算负值的问题
+    # 🚀 强制正序排列，解决负值问题！
     combined_df = combined_df.sort_index(ascending=True)
-    
-    # 向前填充缺失值（解决中美节假日不对齐的问题）
     combined_df = combined_df.ffill().dropna(how='all')
     
     start_dt = pd.to_datetime(start_date) - pd.Timedelta(days=365) 
