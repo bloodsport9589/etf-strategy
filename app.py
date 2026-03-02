@@ -61,6 +61,7 @@ def get_clean_data(assets_dict, start_date, end_date):
     import requests
     import pandas as pd
     import time
+    import io
 
     combined_df = pd.DataFrame()
     error_logs = []
@@ -72,64 +73,74 @@ def get_clean_data(assets_dict, start_date, end_date):
         progress_bar.progress((i + 1) / total)
         series = None
         
-        # 🟢 1. 专门为南方原油开辟绝对通道 (东财底层 API)
+        # 🟢 1. 专门为南方原油开辟通道 (东财 + 网易双保险)
         if "501018" in ticker:
             try:
-                url = "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=1.501018&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53&klt=101&fqt=2&end=20500101&lmt=1000"
-                res = requests.get(url, timeout=5).json()
+                # 尝试东财 HTTP 通道 (去掉了 https，防止被强制掐断)
+                url = "http://push2his.eastmoney.com/api/qt/stock/kline/get?secid=1.501018&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53&klt=101&fqt=2&end=20500101&lmt=1000"
+                res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5).json()
                 klines = res['data']['klines']
                 dates = [k.split(',')[0] for k in klines]
                 closes = [float(k.split(',')[2]) for k in klines]
                 series = pd.Series(closes, index=pd.to_datetime(dates), name=name)
-            except Exception as e:
-                error_logs.append(f"南方原油抓取失败: {e}")
+            except Exception as e1:
+                # 东财如果还断连，无缝切换网易财经终极 CSV 通道
+                try:
+                    url_163 = "http://quotes.money.163.com/service/chddata.html?code=0501018&start=20200101&end=20300101&fields=TCLOSE"
+                    res_163 = requests.get(url_163, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+                    df_ntes = pd.read_csv(io.StringIO(res_163.text), encoding='gbk')
+                    df_ntes['日期'] = pd.to_datetime(df_ntes['日期'])
+                    df_ntes = df_ntes[df_ntes['收盘价'] > 0]
+                    series = df_ntes.set_index('日期')['收盘价'].astype(float).sort_index()
+                    series.name = name
+                except Exception as e2:
+                    error_logs.append(f"南方原油双通道均失败: {e1} / {e2}")
         
-        # 🔵 2. 其他 ETF 使用最稳定的 yf.Ticker() 单只拉取，避开批量下载的错乱 bug
+        # 🔵 2. 其他 ETF 恢复最原生、最干净的 Yahoo Finance 抓取
         else:
             try:
-                # 兼容 Yahoo 对国内 ETF 的后缀习惯
-                yf_ticker = ticker if ".SS" in ticker else ticker.replace(".SZ", ".SS")
-                tk = yf.Ticker(yf_ticker)
-                df_yf = tk.history(period="2y") # 简单粗暴直接拉取近2年
+                # 移除了所有自作聪明的后缀替换，直接用原生 ticker (如 159915.SZ)
+                tk = yf.Ticker(ticker)
+                df_yf = tk.history(period="3y") 
                 
                 if not df_yf.empty:
                     series = df_yf['Close']
-                    # 去除时区，纯净对齐
-                    if series.index.tz is not None:
-                        series.index = series.index.tz_localize(None)
-                    series.index = series.index.normalize()
                     series.name = name
             except Exception as e:
                 error_logs.append(f"{name} 抓取失败: {e}")
 
-        # 🟡 3. 数据安全合并
+        # 🟡 3. 终极数据清洗与合并 (解决全员负值 Bug)
         if series is not None and not series.empty:
-            # 剔除可能存在的 0 或负数异常值
-            series = series[series > 0]
+            # 剥离时区，对齐到纯净的年月日！这步极其关键！
+            if series.index.tz is not None:
+                series.index = series.index.tz_localize(None)
+            series.index = pd.to_datetime(series.index).normalize()
+            
+            # 剔除同一天的重复数据
+            series = series[~series.index.duplicated(keep='last')]
+            
             if combined_df.empty:
                 combined_df = pd.DataFrame({name: series})
             else:
                 combined_df = combined_df.join(series, how='outer')
                 
-        time.sleep(0.2) # 防止请求过快被封
+        time.sleep(0.1) 
 
     progress_bar.empty()
 
-    # 🚨 如果有任何标的失败，直接在 UI 顶端红色警告打印原因！
     if error_logs:
-        st.error("⚠️ 部分数据缺失诊断日志：\n" + "\n".join(error_logs))
+        st.error("⚠️ 数据诊断日志：\n" + "\n".join(error_logs))
 
     if combined_df.empty:
         return combined_df
 
-    # 🛠️ 核心修复：强制日期正序排列，否则算出来的动能全部为负！
+    # 强制正序排列，彻底修复计算负值的问题
     combined_df = combined_df.sort_index(ascending=True)
     
-    # 填补交易日缺口
+    # 向前填充缺失值（解决中美节假日不对齐的问题）
     combined_df = combined_df.ffill().dropna(how='all')
     
-    # 裁剪到用户需要的时间范围
-    start_dt = pd.to_datetime(start_date) - pd.Timedelta(days=365) # 预留计算长均线的提前量
+    start_dt = pd.to_datetime(start_date) - pd.Timedelta(days=365) 
     end_dt = pd.to_datetime(end_date) + pd.Timedelta(days=1)
     
     mask = (combined_df.index >= start_dt) & (combined_df.index <= end_dt)
