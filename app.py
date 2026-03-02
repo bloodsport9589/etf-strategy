@@ -77,10 +77,12 @@ def get_clean_data(assets_dict, start_date, end_date):
     total = len(targets)
     error_logs = []
 
+    # 伪装正常浏览器，绝不触发 API 防火墙
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
+    # 🚀 全军出击：所有标的统一使用东方财富 CDN
     for i, (ticker, name) in enumerate(targets.items()):
-        status_text.text(f"🚀 正在清洗与解析 ({i+1}/{total}): {name}...")
+        status_text.text(f"🚀 正在通过东财 CDN 获取 ({i+1}/{total}): {name}...")
         progress_bar.progress((i + 1) / total)
         
         code_num = ticker.split('.')[0]
@@ -90,9 +92,11 @@ def get_clean_data(assets_dict, start_date, end_date):
             res = requests.get(url, headers=headers, timeout=5)
             res.encoding = 'utf-8'
             
+            # 优先提取 Data_ACWorthTrend (累计净值，自带完美后复权)
             match = re.search(r'var Data_ACWorthTrend\s*=\s*(\[.*?\]);', res.text)
             is_ac = True
             
+            # 如果没有累计净值，降级提取单位净值
             if not match or len(match.group(1)) < 10:
                 match = re.search(r'var Data_netWorthTrend\s*=\s*(\[.*?\]);', res.text)
                 is_ac = False
@@ -108,7 +112,7 @@ def get_clean_data(assets_dict, start_date, end_date):
                     else:
                         continue
                         
-                    # 🛠️ 核心修复 1：拦截 null (NoneType) 脏数据，防止崩溃！
+                    # 🛡️ 核心修复：直接拦截 None (null) 脏数据，纳指和科创50不再崩溃！
                     if val is None or val == "":
                         continue
                         
@@ -138,14 +142,16 @@ def get_clean_data(assets_dict, start_date, end_date):
     if combined_df.empty:
         return combined_df
 
-    # 🛠️ 核心修复 2：绝对强制按时间【正序】排列（老日期在上，新日期在下）
-    # 彻底杜绝动能计算出负值的倒序陷阱！
+    # ==========================================
+    # 终极数据清洗（同源合并，绝对不再有负值 Bug！）
+    # ==========================================
+    # 1. 强制正序排列（动能计算的基石）
     combined_df = combined_df.sort_index(ascending=True)
     
-    # 填充空值并剔除全空行
+    # 2. 向下填充：平滑掉所有的节假日空缺
     combined_df = combined_df.ffill().dropna(how='all')
     
-    # 截取所需时间段
+    # 3. 按设定日期截取
     mask = (combined_df.index >= start_dt) & (combined_df.index <= end_dt)
     return combined_df.loc[mask]
 
